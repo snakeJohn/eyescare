@@ -1,0 +1,91 @@
+name: Apply CI fixes
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch source
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path("crates/eyescare-core/src/config/store.rs")
+          t = p.read_text(encoding="utf-8")
+          old = """    if path.exists() {
+        let bak = path.with_extension(\"json.bak\");
+        let _ = fs::copy(path, &bak);
+    }
+    fs::rename(&tmp, path)?;"""
+          new = """    if path.exists() {
+        let bak = path.with_extension(\"json.bak\");
+        let _ = fs::copy(path, &bak);
+        # Windows rename cannot overwrite.
+        #[cfg(windows)]
+        fs::remove_file(path)?;
+    }
+    fs::rename(&tmp, path)?;"""
+          new = new.replace("# Windows rename cannot overwrite.", "// Windows rename cannot overwrite.")
+          if old not in t:
+              raise SystemExit("store.rs pattern not found")
+          p.write_text(t.replace(old, new, 1), encoding="utf-8")
+
+          p = Path("crates/eyescare-core/src/config/store.rs")
+          t = p.read_text(encoding="utf-8")
+          t = t.replace(
+              "tempfile::tempdir().unwrap().keep().to_path_buf()",
+              "tempfile::tempdir().unwrap().keep()",
+          )
+          p.write_text(t, encoding="utf-8")
+
+          Path("rust-toolchain.toml").write_text(
+              "[toolchain]\nchannel = \"stable\"\n", encoding="utf-8"
+          )
+
+          p = Path("apps/desktop/src-tauri/tauri.conf.json")
+          t = p.read_text(encoding="utf-8")
+          t = t.replace(
+              '"windows": [],',
+              '''"windows": [
+      {
+        "label": "settings",
+        "title": "EyesCare",
+        "width": 960,
+        "height": 680,
+        "resizable": true,
+        "visible": false,
+        "create": false
+      }
+    ],''',
+          )
+          p.write_text(t, encoding="utf-8")
+
+          p = Path("apps/desktop/src-tauri/src/lib.rs")
+          t = p.read_text(encoding="utf-8")
+          t = t.replace("acc.is_multiple_of(60)", "*acc % 60 == 0")
+          p.write_text(t, encoding="utf-8")
+
+          p = Path("Cargo.toml")
+          t = p.read_text(encoding="utf-8")
+          t = t.replace("strip = true", 'strip = "debuginfo"')
+          p.write_text(t, encoding="utf-8")
+          print("patched ok")
+          PY
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates/eyescare-core/src/config/store.rs rust-toolchain.toml \
+            apps/desktop/src-tauri/tauri.conf.json apps/desktop/src-tauri/src/lib.rs Cargo.toml
+          git status
+          git commit -m "Fix Windows atomic save, toolchain target, and Tauri window config" || echo "nothing"
+          git push
