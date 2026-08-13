@@ -73,8 +73,10 @@ impl WindowsDisplayBackend {
         let mut out = Vec::new();
         let mut idx: u32 = 0;
         loop {
-            let mut dd = DISPLAY_DEVICEW::default();
-            dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+            let mut dd = DISPLAY_DEVICEW {
+                cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                ..Default::default()
+            };
             let ok = unsafe { EnumDisplayDevicesW(PCWSTR::null(), idx, &mut dd, 0) };
             if !ok.as_bool() {
                 break;
@@ -206,8 +208,10 @@ impl WindowsDisplayBackend {
     fn device_present(device_name: &str) -> bool {
         let mut idx: u32 = 0;
         loop {
-            let mut dd = DISPLAY_DEVICEW::default();
-            dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+            let mut dd = DISPLAY_DEVICEW {
+                cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                ..Default::default()
+            };
             let ok = unsafe { EnumDisplayDevicesW(PCWSTR::null(), idx, &mut dd, 0) };
             if !ok.as_bool() {
                 return false;

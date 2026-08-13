@@ -169,13 +169,22 @@ mod tests {
     #[test]
     fn cross_midnight_day_start() {
         // 极端配置：day_start 01:00, night_start 13:00
+        // 过渡窗口在目标时刻之前：13:00 夜间过渡 = [12:00, 13:00]，01:00 日间过渡 = [00:00, 01:00]
         let c = cfg("01:00", "13:00", 60);
         // 11:00 尚未进入 13:00 前的过渡（-2h < -1h）→ 日间
         let noon = day_night_kelvin(&c, t(11, 0));
         let night = day_night_kelvin(&c, t(20, 0));
-        assert!(noon > night);
-        // 12:00 已进入过渡尾部 → 接近夜间
-        let tail = day_night_kelvin(&c, t(12, 0));
-        assert!(tail < noon);
+        assert!(noon > night, "noon={noon} night={night}");
+        // 12:00 是夜间过渡起点，色温仍等于日间；12:30 才进入过渡中段
+        let start = day_night_kelvin(&c, t(12, 0));
+        assert_eq!(start, noon, "transition start must still be day kelvin");
+        let mid = day_night_kelvin(&c, t(12, 30));
+        assert!(mid < noon, "mid={mid} noon={noon}");
+        // 00:30 跨午夜，处于 01:00 前的早晨过渡
+        let predawn = day_night_kelvin(&c, t(0, 30));
+        assert!(
+            predawn > night && predawn < noon,
+            "predawn={predawn} night={night} noon={noon}"
+        );
     }
 }

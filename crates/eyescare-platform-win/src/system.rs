@@ -45,8 +45,10 @@ impl WindowsSystemBackend {
         let mut out = Vec::new();
         let mut idx: u32 = 0;
         loop {
-            let mut dd = windows::Win32::Graphics::Gdi::DISPLAY_DEVICEW::default();
-            dd.cb = std::mem::size_of::<windows::Win32::Graphics::Gdi::DISPLAY_DEVICEW>() as u32;
+            let mut dd = windows::Win32::Graphics::Gdi::DISPLAY_DEVICEW {
+                cb: std::mem::size_of::<windows::Win32::Graphics::Gdi::DISPLAY_DEVICEW>() as u32,
+                ..Default::default()
+            };
             let ok = unsafe {
                 windows::Win32::Graphics::Gdi::EnumDisplayDevicesW(
                     PCWSTR::null(),

@@ -161,6 +161,9 @@ pub fn atomic_write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if path.exists() {
         let bak = path.with_extension("json.bak");
         let _ = fs::copy(path, &bak);
+        // Windows rename 不能覆盖已存在的目标文件。
+        #[cfg(windows)]
+        fs::remove_file(path)?;
     }
     fs::rename(&tmp, path)?;
     // 目录 fsync 保证 rename 持久
@@ -200,6 +203,19 @@ mod tests {
         assert_eq!(loaded.display.kelvin, 3800);
         // 无 .tmp 残留
         assert!(!store.config_path().with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn atomic_save_overwrites_existing() {
+        let store = ConfigStore::new(tmpdir());
+        let mut cfg = AppConfig::default();
+        cfg.display.kelvin = 3800;
+        store.save_config(&cfg).unwrap();
+        cfg.display.kelvin = 4200;
+        store.save_config(&cfg).unwrap();
+        let loaded = store.load_config().unwrap();
+        assert_eq!(loaded.display.kelvin, 4200);
+        assert!(store.config_path().with_extension("json.bak").exists());
     }
 
     #[test]
