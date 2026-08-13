@@ -9,6 +9,7 @@
 //! 平台后端通过 `DisplayBackend` trait 注入，单测用 MockBackend。
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use eyescare_platform::{ApplyOutcome, ApplyReport, DisplayBackend, DisplayId, Ramp};
@@ -55,6 +56,8 @@ pub struct DisplayService {
     animating: Mutex<BTreeMap<String, (Ramp, Ramp, f64)>>, // (from, to, progress)
     /// 过渡时长 ms（P1 退出/常规微调）。
     transition_ms: u64,
+    /// restore_all / 关滤镜后禁止 apply，避免 tick 回写。
+    applies_enabled: AtomicBool,
 }
 
 impl DisplayService {
@@ -67,7 +70,12 @@ impl DisplayService {
             target: Mutex::new(BTreeMap::new()),
             animating: Mutex::new(BTreeMap::new()),
             transition_ms: 500,
+            applies_enabled: AtomicBool::new(true),
         }
+    }
+
+    pub fn set_applies_enabled(&self, on: bool) {
+        self.applies_enabled.store(on, Ordering::Relaxed);
     }
 
     /// 强制刷新显示器枚举缓存（启动、WM_DISPLAYCHANGE、rebind 后调用）。
@@ -130,41 +138,60 @@ impl DisplayService {
             let target_ramp = t.ramp();
             let prev_target = self.target.lock().unwrap().get(&t.display_id).cloned();
 
-            // 目标未变化且未在动画中 → 跳过（省 apply）
+            // 目标未变化：已落地则跳过；动画中且终点未变则不重置 progress
             let unchanged = prev_target.as_ref().map(|p| *p == target_ramp).unwrap_or(false);
-            let in_anim = self.animating.lock().unwrap().contains_key(&t.display_id);
-
-            if unchanged && !in_anim {
+            if unchanged {
                 continue;
             }
 
-            let from = self
-                .current
-                .lock()
-                .unwrap()
+            // P0/P1 identity：restore 启动快照，不写 identity ramp（设计 §4.6）
+            if t.is_identity {
+                if !self.applies_enabled.load(Ordering::Relaxed) {
+                    continue;
+                }
+                self.backend.restore(&DisplayId(t.display_id.clone()))?;
+                self.target
+                    .lock()
+                    .unwrap()
+                    .insert(t.display_id.clone(), Ramp::identity());
+                next_current.insert(t.display_id.clone(), Ramp::identity());
+                self.animating.lock().unwrap().remove(&t.display_id);
+                summary.applied.push(ApplyReport {
+                    display_id: DisplayId(t.display_id.clone()),
+                    outcome: ApplyOutcome::Applied,
+                    readback_diff: 0.0,
+                    readback_vs_original_diff: 0.0,
+                });
+                continue;
+            }
+
+            let from = next_current
                 .get(&t.display_id)
                 .cloned()
                 .unwrap_or_else(Ramp::identity);
 
-            // P1 进入 / 紧急恢复（identity 目标）：立即应用，无动画（设计 §4.6）
-            // 首次出现：直接应用
-            // 其余（旁路退出、同优先级微调、优先级切换）：从当前实际插向新目标
-            let apply_now = if t.is_identity || prev_target.is_none() {
-                Some(target_ramp.clone())
+            if prev_target.is_none() {
+                // 首次出现：直接 apply；仅 Applied 写入 current/target
+                let report = self.apply_one(&t.display_id, &target_ramp)?;
+                if report.outcome == ApplyOutcome::Applied {
+                    self.target
+                        .lock()
+                        .unwrap()
+                        .insert(t.display_id.clone(), target_ramp.clone());
+                    next_current.insert(t.display_id.clone(), target_ramp.clone());
+                }
+                self.animating.lock().unwrap().remove(&t.display_id);
+                self.classify(&mut summary, report);
             } else {
+                // 启动动画：立即记下终点（非插值）；pump 只推进 current
+                self.target
+                    .lock()
+                    .unwrap()
+                    .insert(t.display_id.clone(), target_ramp.clone());
                 self.animating.lock().unwrap().insert(
                     t.display_id.clone(),
                     (from, target_ramp.clone(), 0.0),
                 );
-                None
-            };
-
-            if let Some(ramp) = apply_now {
-                let report = self.apply_one(&t.display_id, &ramp)?;
-                self.target.lock().unwrap().insert(t.display_id.clone(), ramp.clone());
-                next_current.insert(t.display_id.clone(), ramp.clone());
-                self.animating.lock().unwrap().remove(&t.display_id);
-                self.classify(&mut summary, report);
             }
         }
 
@@ -208,12 +235,23 @@ impl DisplayService {
                 lerp_ramp(&from, &to, new_progress)
             };
             let report = self.apply_one(&id, &ramp)?;
-            self.target.lock().unwrap().insert(id.clone(), ramp.clone());
-            self.current.lock().unwrap().insert(id.clone(), ramp.clone());
-            if new_progress >= 1.0 {
-                finished.push(id.clone());
+            // pump 只更新 current；target 保持动画终点
+            if report.outcome == ApplyOutcome::Applied {
+                self.current.lock().unwrap().insert(id.clone(), ramp.clone());
+                if new_progress >= 1.0 {
+                    finished.push(id.clone());
+                } else {
+                    self.animating
+                        .lock()
+                        .unwrap()
+                        .insert(id.clone(), (from, to, new_progress));
+                }
             } else {
-                self.animating.lock().unwrap().insert(id.clone(), (from, to, new_progress));
+                // Rejected / skip：保持动画，下次 pump 重试（不得把终点当成已落地）
+                self.animating.lock().unwrap().insert(
+                    id.clone(),
+                    (from, to, progress.min(0.999)),
+                );
             }
             self.classify(&mut summary, report);
         }
@@ -224,6 +262,14 @@ impl DisplayService {
     }
 
     fn apply_one(&self, id: &str, ramp: &Ramp) -> Result<ApplyReport, DisplayServiceError> {
+        if !self.applies_enabled.load(Ordering::Relaxed) {
+            return Ok(ApplyReport {
+                display_id: DisplayId(id.to_string()),
+                outcome: ApplyOutcome::Rejected,
+                readback_diff: 0.0,
+                readback_vs_original_diff: 0.0,
+            });
+        }
         // HDR 屏由 backend 返回 HdrSkipped；后端负责策略
         let report = self
             .backend
@@ -244,6 +290,7 @@ impl DisplayService {
 
     /// 恢复全部屏到启动快照（托盘「恢复显示」/退出钩子）。
     pub fn restore_all(&self) -> Result<(), DisplayServiceError> {
+        self.applies_enabled.store(false, Ordering::Relaxed);
         self.backend.restore_all()?;
         self.sources.lock().unwrap().clear();
         self.animating.lock().unwrap().clear();
@@ -283,12 +330,13 @@ mod tests {
     use super::*;
     use crate::display::math::build_ramp;
 
-    /// Mock backend：记录 apply 调用，可注入 readback 失败。
+    /// Mock backend：记录 apply / restore 调用，可注入 readback 失败。
     #[derive(Default)]
     struct MockBackend {
         applied: std::sync::Mutex<Vec<(String, Ramp)>>,
         fail_next: std::sync::Mutex<bool>,
         enum_count: std::sync::atomic::AtomicU64,
+        restored: std::sync::Mutex<Vec<String>>,
     }
 
     impl MockBackend {
@@ -300,6 +348,18 @@ mod tests {
         }
         fn set_fail(&self, on: bool) {
             *self.fail_next.lock().unwrap() = on;
+        }
+        fn restore_count(&self) -> usize {
+            self.restored.lock().unwrap().len()
+        }
+        fn last_ramp_for(&self, id: &str) -> Option<Ramp> {
+            self.applied
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(d, _)| d == id)
+                .map(|(_, r)| r.clone())
         }
     }
 
@@ -349,7 +409,8 @@ mod tests {
                 readback_vs_original_diff: 0.5,
             })
         }
-        fn restore(&self, _id: &DisplayId) -> eyescare_platform::Result<()> {
+        fn restore(&self, id: &DisplayId) -> eyescare_platform::Result<()> {
+            self.restored.lock().unwrap().push(id.0.clone());
             Ok(())
         }
         fn restore_all(&self) -> eyescare_platform::Result<()> {
@@ -401,11 +462,27 @@ mod tests {
         let (svc, backend) = svc();
         svc.set_source("daynight", vec![("D1".into(), Claim::day_night(3400))]);
         svc.recompute().unwrap();
-        // 进入旁路
+        let after_filter = backend.last_ramp_for("D1").unwrap();
+        assert!(!after_filter.is_identity());
+        let apply_n = backend.applied_count();
+        let restore_n = backend.restore_count();
+        // 进入旁路：P1 必须 restore 快照，不得再 apply_ramp(identity)
         svc.set_source("safe", vec![("D1".into(), Claim::safe_bypass())]);
         let summary = svc.recompute().unwrap();
-        let last = backend.last_ramp().unwrap();
-        assert!(last.is_identity(), "P1 must restore identity immediately");
+        assert!(
+            backend.restore_count() > restore_n,
+            "P1 must call backend.restore"
+        );
+        assert_eq!(
+            backend.applied_count(),
+            apply_n,
+            "P1 must not apply_ramp identity"
+        );
+        let last = backend.last_ramp_for("D1").unwrap();
+        assert!(
+            !last.is_identity(),
+            "last applied ramp must not be a forced identity write"
+        );
         assert!(!summary.applied.is_empty());
     }
 
@@ -420,15 +497,70 @@ mod tests {
     }
 
     #[test]
+    fn rejected_apply_is_retried() {
+        let (svc, backend) = svc();
+        svc.set_source("daynight", vec![("D1".into(), Claim::day_night(3400))]);
+        backend.set_fail(true);
+        let s1 = svc.recompute().unwrap();
+        assert_eq!(s1.rejected.len(), 1);
+        assert!(svc.current_targets().get("D1").is_none());
+        let n1 = backend.applied_count();
+        // fail_next 已消耗：同 claim 再 recompute 必须重试 apply
+        let s2 = svc.recompute().unwrap();
+        assert_eq!(s2.rejected.len(), 0);
+        assert_eq!(s2.applied.len(), 1);
+        assert!(
+            backend.applied_count() > n1,
+            "rejected apply must retry next recompute"
+        );
+        assert!(svc.current_targets().get("D1").is_some());
+    }
+
+    #[test]
+    fn rejected_pump_keeps_anim_and_retries() {
+        let (svc, backend) = svc();
+        svc.set_source("daynight", vec![("D1".into(), Claim::day_night(3400))]);
+        svc.recompute().unwrap();
+        svc.set_source("daynight", vec![("D1".into(), Claim::day_night(5500))]);
+        svc.recompute().unwrap();
+        backend.set_fail(true);
+        let s1 = svc.pump().unwrap();
+        assert_eq!(s1.rejected.len(), 1);
+        assert!(svc.is_animating(), "rejected pump must not settle animation");
+        let n1 = backend.applied_count();
+        let s2 = svc.pump().unwrap();
+        assert_eq!(s2.rejected.len(), 0);
+        assert!(backend.applied_count() > n1);
+        assert!(!svc.is_animating());
+    }
+
+    #[test]
+    fn restore_all_blocks_later_apply() {
+        let (svc, backend) = svc();
+        svc.set_source("daynight", vec![("D1".into(), Claim::day_night(3400))]);
+        svc.recompute().unwrap();
+        let n = backend.applied_count();
+        svc.restore_all().unwrap();
+        svc.set_source("daynight", vec![("D1".into(), Claim::day_night(5500))]);
+        let _ = svc.recompute().unwrap();
+        assert_eq!(
+            backend.applied_count(),
+            n,
+            "apply after restore_all must no-op until re-enabled"
+        );
+    }
+
+    #[test]
     fn remove_source_falls_back_to_default() {
         let (svc, backend) = svc();
         svc.set_source("daynight", vec![("D1".into(), Claim::day_night(3400))]);
         svc.recompute().unwrap();
+        let restore_n = backend.restore_count();
         svc.remove_source("daynight");
         let summary = svc.recompute().unwrap();
-        // 无 claims → identity（is_identity 路径）
-        let last = backend.last_ramp().unwrap();
-        assert!(last.is_identity());
+        // 无 claims → identity：restore 快照，不写 identity ramp
+        assert!(backend.restore_count() > restore_n);
+        assert!(!backend.last_ramp_for("D1").unwrap().is_identity());
         assert_eq!(summary.applied.len(), 1);
     }
 
@@ -439,9 +571,11 @@ mod tests {
         svc.recompute().unwrap();
         svc.restore_all().unwrap();
         assert!(svc.current_targets().is_empty());
-        // 恢复后再 recompute：identity（无 claims）
+        let restore_n = backend.restore_count();
+        // restore_all 会禁止后续 apply；重新打开滤镜时再允许
+        svc.set_applies_enabled(true);
         let summary = svc.recompute().unwrap();
-        assert!(backend.last_ramp().unwrap().is_identity());
+        assert!(backend.restore_count() >= restore_n + 2);
         assert_eq!(summary.applied.len(), 2);
     }
 
@@ -481,8 +615,50 @@ mod tests {
         // 壳层 1s 一拍：一次 pump 覆盖 500ms 过渡
         svc.pump().unwrap();
         let last = backend.last_ramp().unwrap();
-        let target = build_ramp(5500, 1.0, 0.35);
+        let target = build_ramp(5500, 0.85, 0.35);
         assert!(last.mean_abs_diff(&target) < 0.01, "should converge to target");
         assert!(last.mean_abs_diff(&first) > 0.01, "should have moved");
+    }
+
+    #[test]
+    fn animation_target_is_destination_immediately() {
+        let (svc, _backend) = svc();
+        svc.set_source("daynight", vec![("D1".into(), Claim::day_night(3400))]);
+        svc.recompute().unwrap();
+        svc.set_source("daynight", vec![("D1".into(), Claim::day_night(5500))]);
+        svc.recompute().unwrap();
+        let dest = build_ramp(5500, 0.85, 0.35);
+        let stored = svc.current_targets().get("D1").cloned().unwrap();
+        assert!(
+            stored.mean_abs_diff(&dest) < 0.01,
+            "target must be destination immediately"
+        );
+        assert!(svc.is_animating());
+        // 未完成的 pump 只推进 current，不得把插值写入 target
+        svc.pump_dt(100.0).unwrap();
+        let stored_after = svc.current_targets().get("D1").cloned().unwrap();
+        assert!(
+            stored_after.mean_abs_diff(&dest) < 0.01,
+            "pump must not write lerp into target"
+        );
+        assert!(svc.is_animating());
+    }
+
+    #[test]
+    fn recompute_same_destination_does_not_reset_anim() {
+        let (svc, backend) = svc();
+        svc.set_source("daynight", vec![("D1".into(), Claim::day_night(3400))]);
+        svc.recompute().unwrap();
+        svc.set_source("daynight", vec![("D1".into(), Claim::day_night(5500))]);
+        svc.recompute().unwrap();
+        svc.pump_dt(100.0).unwrap(); // progress 0.2
+        svc.recompute().unwrap(); // 终点未变：不得把 progress 重置为 0
+        svc.pump_dt(400.0).unwrap(); // 0.2 + 0.8 = 1.0
+        assert!(
+            !svc.is_animating(),
+            "same destination must not reset animation progress"
+        );
+        let dest = build_ramp(5500, 0.85, 0.35);
+        assert!(backend.last_ramp().unwrap().mean_abs_diff(&dest) < 0.01);
     }
 }

@@ -49,10 +49,9 @@ pub fn build_ramp(kelvin: u32, brightness: f64, min_floor: f64) -> Ramp {
     let identity = RampChannel::identity();
     let make = |factor: f64| {
         let mut c = [0u16; 256];
-        for (i, v) in identity.0.iter().enumerate() {
-            let t = *v as f64 / 65535.0;
-            let target = (t * factor).clamp(floor, 1.0);
-            c[i] = (target * 65535.0).round() as u16;
+        for (slot, v) in c.iter_mut().zip(identity.0.iter()) {
+            let target = (*v as f64 / 65535.0) * factor;
+            *slot = (target * 65535.0).round() as u16;
         }
         RampChannel(c)
     };
@@ -74,10 +73,13 @@ pub fn build_ramp(kelvin: u32, brightness: f64, min_floor: f64) -> Ramp {
         }
     };
 
+    // floor 约束通道因子，再按 identity 缩放（不抬升暗部 LUT）
+    let channel_factor = |rgb: f64| soften(rgb * bfactor).clamp(floor, 1.0);
+
     Ramp {
-        red: make(soften(r * bfactor)),
-        green: make(soften(g * bfactor)),
-        blue: make(soften(b * bfactor)),
+        red: make(channel_factor(r)),
+        green: make(channel_factor(g)),
+        blue: make(channel_factor(b)),
     }
 }
 
@@ -176,19 +178,26 @@ mod tests {
         // 中点值应低于 identity（压暗）
         let id = RampChannel::identity();
         assert!(r.red.0[128] < id.0[128]);
-        // 最小通道不低于 floor
+        // floor 作用于通道因子（中高灰度），不抬升 sample 0
         for ch in [&r.red, &r.green, &r.blue] {
-            let min_ratio = ch.0.iter().map(|v| *v as f64 / 65535.0).fold(1.0, f64::min);
+            let min_ratio = (128..256)
+                .map(|i| ch.0[i] as f64 / id.0[i] as f64)
+                .fold(1.0, f64::min);
             assert!(min_ratio >= 0.35 - 1e-3, "floor violated: {min_ratio}");
         }
     }
 
     #[test]
     fn full_brightness_near_identity() {
-        // 6500K + brightness 1.0 → 接近 identity（偏差应很小）
-        let r = build_ramp(6500, 1.0, 0.0);
+        // 6500K + brightness 1.0 + floor 0.35 → 接近 identity（暗部不被抬升）
+        let r = build_ramp(6500, 1.0, 0.35);
         let diff = r.mean_abs_diff(&Ramp::identity());
         assert!(diff < 0.03, "unexpected deviation {diff}");
+        // index 0 保持接近 0，而不是被 floor 抬到 ~0.35
+        for ch in [&r.red, &r.green, &r.blue] {
+            let v0 = ch.0[0] as f64 / 65535.0;
+            assert!(v0 < 0.01, "index 0 should stay near 0, got {v0}");
+        }
     }
 
     #[test]

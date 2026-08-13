@@ -7,8 +7,16 @@ use chrono::{Local, NaiveTime, Timelike};
 
 use crate::config::DayNightConfig;
 
+/// 一天秒数（圆环周期）。
+const DAY_SECS: i64 = 24 * 3600;
+
+/// `[start, end)` 是否包含 `now`（模 86400）。
+fn in_forward_span(now: i64, start: i64, end: i64) -> bool {
+    (now - start).rem_euclid(DAY_SECS) < (end - start).rem_euclid(DAY_SECS)
+}
+
 /// 给定本地时间，返回目标色温（K）。
-/// 过渡段内做线性插值：day_start 前后 ±transition/2 分钟。
+/// 夜间为圆环前向区间 `[night_start, day_start)`；过渡为各目标前 `transition` 分钟。
 pub fn day_night_kelvin(cfg: &DayNightConfig, now: NaiveTime) -> u32 {
     if !cfg.enabled {
         return day_kelvin();
@@ -22,38 +30,28 @@ pub fn day_night_kelvin(cfg: &DayNightConfig, now: NaiveTime) -> u32 {
     let day_s = secs(day);
     let night_s = secs(night);
 
-    // 线性时差（可为负；跨午夜用周期语义：now-目标 < -transition 视为更早的"另一侧"）。
-    // 过渡窗口：目标时刻前 transition 秒内完成插值；目标时刻后即稳定。
-    let transition_sec = (transition * 60) as f64;
-    let d_day = now_s - day_s;
-    let d_night = now_s - night_s;
-
+    let transition_sec = transition * 60;
     let day_k = day_kelvin() as f64;
     let night_k = night_kelvin() as f64;
 
-    // 过渡窗口在目标时刻之前：progress 0 = 窗口起点（旧色温），1 = 目标时刻（新色温）。
-    // 旧公式用「距目标的剩余比例」当 progress，方向反了，且在目标时刻会跳变。
-    let day_target = if d_day >= 0 {
-        day_k
-    } else if (-d_day as f64) <= transition_sec {
-        let progress = 1.0 - (-d_day as f64) / transition_sec;
+    // 圆环上距目标的前向秒数（0 = 已到点）；过渡窗口可跨 00:00。
+    let until = |target: i64| (target - now_s).rem_euclid(DAY_SECS);
+    let until_day = until(day_s);
+    let until_night = until(night_s);
+
+    let k = if until_day > 0 && until_day <= transition_sec {
+        let progress = 1.0 - (until_day as f64) / (transition_sec as f64);
         night_k + (day_k - night_k) * progress
-    } else {
-        night_k
-    };
-
-    let night_target = if d_night >= 0 {
-        night_k
-    } else if (-d_night as f64) <= transition_sec {
-        let progress = 1.0 - (-d_night as f64) / transition_sec;
+    } else if until_night > 0 && until_night <= transition_sec {
+        let progress = 1.0 - (until_night as f64) / (transition_sec as f64);
         day_k + (night_k - day_k) * progress
+    } else if in_forward_span(now_s, night_s, day_s) {
+        night_k
     } else {
         day_k
     };
 
-    // 取两者中色温更低（更暖）者——夜晚需求优先。
-    let k = day_target.min(night_target).clamp(1000.0, 10000.0);
-    k.round() as u32
+    k.clamp(1000.0, 10000.0).round() as u32
 }
 
 /// 白天色温（health 预设 4500K 为日间基线；DayNight 白天用 5500 办公色温更自然）。
@@ -185,6 +183,34 @@ mod tests {
         assert!(
             predawn > night && predawn < noon,
             "predawn={predawn} night={night} noon={noon}"
+        );
+    }
+
+    #[test]
+    fn night_start_after_midnight_circular() {
+        // night_start=00:30 跨午夜：夜间 = [00:30, 08:00)；傍晚过渡 [23:30, 00:30)
+        let c = cfg("08:00", "00:30", 60);
+        let noon = day_night_kelvin(&c, t(12, 0));
+        let late = day_night_kelvin(&c, t(3, 0));
+        assert!(noon >= 5000, "12:00 must be day: noon={noon}");
+        assert!(late <= 3600, "03:00 must be night: late={late}");
+
+        // 23:00 距 00:30 还有 90min，在 60min 窗外 → 日间
+        let eve = day_night_kelvin(&c, t(23, 0));
+        assert!(eve >= 5000, "23:00 still day: eve={eve}");
+
+        // 00:00 在傍晚过渡（距 00:30 还有 30min）：比正午暖、比深夜凉
+        let wrap = day_night_kelvin(&c, t(0, 0));
+        assert!(
+            wrap < noon && wrap > late,
+            "00:00 evening transition: wrap={wrap} noon={noon} late={late}"
+        );
+
+        // 07:30 早晨过渡
+        let morn = day_night_kelvin(&c, t(7, 30));
+        assert!(
+            morn > late && morn < noon,
+            "07:30 morning transition: morn={morn} late={late} noon={noon}"
         );
     }
 }

@@ -128,16 +128,23 @@ impl TimerService {
 
     /// 周期性 tick（建议 1s）。`breaks_policy` 为当前全屏策略。
     pub fn tick(&mut self, now: Instant, breaks_policy: BreaksPolicy) -> Vec<TimerEvent> {
-        // 空闲检测
+        // 空闲检测：Working / PreBreak 均可暂停，避免预通知窗口空闲仍倒计时到 BreakDue
         let idle_sec = self
             .last_input
             .map(|t| now.saturating_duration_since(t).as_secs())
             .unwrap_or(0);
-        if self.state == TimerState::Working && idle_sec >= self.idle_pause_sec {
+        if matches!(self.state, TimerState::Working | TimerState::PreBreak)
+            && idle_sec >= self.idle_pause_sec
+        {
             self.state = TimerState::Paused;
             self.events.push(TimerEvent::PausedChanged { paused: true });
         } else if self.state == TimerState::Paused && idle_sec < self.idle_pause_sec {
-            self.state = TimerState::Working;
+            // 若在 PreBreak 中暂停，恢复预通知窗口而不是丢掉倒计时
+            self.state = if self.prebreak_remaining.is_some() {
+                TimerState::PreBreak
+            } else {
+                TimerState::Working
+            };
             self.events.push(TimerEvent::PausedChanged { paused: false });
         }
 
@@ -214,6 +221,7 @@ impl TimerService {
     fn finish_break(&mut self, completed: bool) {
         self.state = TimerState::Working;
         self.break_remaining = None;
+        self.prebreak_remaining = None;
         self.kind = None;
         self.work_elapsed = Duration::ZERO;
         self.events.push(TimerEvent::BreakFinished { completed });
@@ -228,20 +236,21 @@ impl TimerService {
         }
     }
 
-    /// 推迟休息一次（snooze = work_sec 的 20%，MVP 固定 5min）。
+    /// 推迟休息一次（snooze = work_sec 的 20%，MVP 固定 5min）。PreBreak 同样可推迟。
     pub fn snooze(&mut self) {
-        if self.state == TimerState::Break && !self.snoozed_once {
+        if matches!(self.state, TimerState::Break | TimerState::PreBreak) && !self.snoozed_once {
             self.snoozed_once = true;
             self.state = TimerState::Working;
             self.break_remaining = None;
+            self.prebreak_remaining = None;
             self.kind = None;
             self.work_elapsed = Duration::from_secs((self.cfg.work_sec as u64) * 4 / 5);
         }
     }
 
-    /// 跳过本次休息。
+    /// 跳过本次休息（Break 或 PreBreak 预通知）。
     pub fn skip(&mut self) {
-        if self.state == TimerState::Break {
+        if matches!(self.state, TimerState::Break | TimerState::PreBreak) {
             self.skipped = true;
             self.finish_break(false);
         }
@@ -399,5 +408,46 @@ mod tests {
         assert_eq!(t.state(), TimerState::Break);
         t.snooze();
         assert_eq!(t.state(), TimerState::Working);
+    }
+
+    #[test]
+    fn idle_during_prebreak_pauses_without_break_due() {
+        let mut t = TimerService::new(TimerConfig {
+            idle_pause_sec: 12,
+            ..cfg(40, 10)
+        });
+        let t0 = Instant::now();
+        t.note_activity_at(t0);
+        // work_sec=40、prebreak=30 → elapsed=10 进入 PreBreak
+        for i in 0..10 {
+            t.tick(t0 + Duration::from_secs(i), BreaksPolicy::Keep);
+        }
+        assert_eq!(t.state(), TimerState::PreBreak);
+        // 空闲达阈值：暂停，不得倒计时到 BreakDue
+        let evs = t.tick(t0 + Duration::from_secs(12), BreaksPolicy::Keep);
+        assert!(evs.contains(&TimerEvent::PausedChanged { paused: true }));
+        assert_eq!(t.state(), TimerState::Paused);
+        assert!(!evs.contains(&TimerEvent::BreakDue));
+        let evs = t.tick(t0 + Duration::from_secs(80), BreaksPolicy::Keep);
+        assert_eq!(t.state(), TimerState::Paused);
+        assert!(!evs.contains(&TimerEvent::BreakDue));
+    }
+
+    #[test]
+    fn skip_during_prebreak_cancels_and_resets() {
+        let mut t = TimerService::new(cfg(40, 10));
+        let t0 = Instant::now();
+        t.note_activity_at(t0);
+        for i in 0..10 {
+            t.tick(t0 + Duration::from_secs(i), BreaksPolicy::Keep);
+        }
+        assert_eq!(t.state(), TimerState::PreBreak);
+        t.skip();
+        assert_eq!(t.state(), TimerState::Working);
+        assert_eq!(t.status().work_elapsed_sec, 0);
+        assert!(t.status().skipped);
+        assert!(t.status().prebreak_remaining_sec.is_none());
+        let evs = t.drain_events();
+        assert!(evs.contains(&TimerEvent::BreakFinished { completed: false }));
     }
 }

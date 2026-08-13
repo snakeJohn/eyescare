@@ -189,9 +189,9 @@ impl SafeModeController {
     /// 场景变化：while_match 规则旁路在匹配条件不再成立时退出。
     /// 返回 true 表示状态变化。
     pub fn scene_changed(&mut self, rule_still_matches: bool, app_key_changed: bool) -> bool {
-        // 更新防抖键的 app 变化基准
+        // app 变化后解除 duration 防抖，否则回同一 app 会被永久拦住
         if app_key_changed {
-            // app 变化后，duration 防抖解除
+            self.last_rule_safe_key = None;
         }
         if self.state == SafeState::RuleOn
             && self.hold == Some(SafeHold::WhileMatch)
@@ -430,5 +430,22 @@ mod tests {
         sm.duration_until = Some(Instant::now() - Duration::from_secs(1));
         assert!(sm.tick());
         assert_eq!(sm.status().state, SafeState::Off);
+    }
+
+    #[test]
+    fn duration_cooldown_clears_on_app_change() {
+        let mut sm = SafeModeController::new(cfg());
+        assert!(sm.rule_eval(Some("r1"), SafeHold::Duration, Some("key-a"), 15));
+        sm.duration_until = Some(Instant::now() - Duration::from_secs(1));
+        assert!(sm.tick());
+        assert_eq!(sm.status().state, SafeState::Off);
+        sm.set_cooldown_key(Some("key-a".into()));
+        // 同 app 仍被防抖拦
+        assert!(!sm.rule_eval(Some("r1"), SafeHold::Duration, Some("key-a"), 15));
+        // 切到非安全 app B：必须解除 duration 防抖
+        sm.scene_changed(false, true);
+        // 回到 A 应允许再次触发
+        assert!(sm.rule_eval(Some("r1"), SafeHold::Duration, Some("key-a"), 15));
+        assert_eq!(sm.status().state, SafeState::RuleOn);
     }
 }

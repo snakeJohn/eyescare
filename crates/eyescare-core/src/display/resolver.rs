@@ -125,7 +125,7 @@ impl ResolvedTarget {
             Some(c) if c.kelvin.is_none() && c.brightness.is_none() => Ramp::identity(),
             Some(c) => {
                 let k = c.kelvin.unwrap_or(4500);
-                let b = c.brightness.unwrap_or(1.0);
+                let b = c.brightness.unwrap_or(0.85);
                 build_ramp(k, b, 0.35)
             }
         }
@@ -155,23 +155,48 @@ impl Resolver {
 
     /// 为指定屏解析最高优先级 claim。数值越小优先级越高（P0 > P1 > ... > P5）。
     pub fn resolve(&self, display_id: &str) -> ResolvedTarget {
-        let mut best: Option<Claim> = None;
+        let mut active: Vec<&Claim> = Vec::new();
         if let Some(list) = self.claims.get(display_id) {
             for c in list {
-                if c.skipped {
-                    continue;
+                if !c.skipped {
+                    active.push(c);
                 }
-                match &best {
-                    None => best = Some(c.clone()),
-                    Some(b) if c.priority < b.priority => best = Some(c.clone()),
-                    _ => {}
-                }
+            }
+        }
+        let mut best: Option<Claim> = None;
+        for c in &active {
+            match &best {
+                None => best = Some((*c).clone()),
+                Some(b) if c.priority < b.priority => best = Some((*c).clone()),
+                _ => {}
             }
         }
         let is_identity = match &best {
             None => true,
             Some(c) => c.priority <= Priority::P1SafeBypass,
         };
+        // P2–P5：未设置的 kelvin/brightness 从更低优先级未跳过 claim 继承。P0/P1 保持 identity。
+        if let Some(ref mut winning) = best {
+            if winning.priority > Priority::P1SafeBypass {
+                let mut lower: Vec<&Claim> = active
+                    .iter()
+                    .copied()
+                    .filter(|c| c.priority > winning.priority)
+                    .collect();
+                lower.sort_by_key(|c| c.priority);
+                for c in lower {
+                    if winning.kelvin.is_none() {
+                        winning.kelvin = c.kelvin;
+                    }
+                    if winning.brightness.is_none() {
+                        winning.brightness = c.brightness;
+                    }
+                    if winning.kelvin.is_some() && winning.brightness.is_some() {
+                        break;
+                    }
+                }
+            }
+        }
         ResolvedTarget {
             display_id: display_id.to_string(),
             claim: best,
@@ -181,10 +206,7 @@ impl Resolver {
 
     /// 全屏解析。
     pub fn resolve_all(&self, display_ids: &[String]) -> Vec<ResolvedTarget> {
-        display_ids
-            .iter()
-            .map(|id| self.resolve(id))
-            .collect()
+        display_ids.iter().map(|id| self.resolve(id)).collect()
     }
 }
 
@@ -245,15 +267,56 @@ mod tests {
         let mut r = Resolver::new();
         r.set_claims(claims_for(
             "D1",
-            vec![
-                Claim::default_preset(4500, 0.85),
-                Claim::day_night(3400),
-            ],
+            vec![Claim::default_preset(4500, 0.85), Claim::day_night(3400)],
         ));
         let t = r.resolve("D1");
         let c = t.claim.clone().unwrap();
         assert_eq!(c.priority, Priority::P4DayNight);
         assert_eq!(c.kelvin, Some(3400));
+    }
+
+    #[test]
+    fn daynight_ramp_inherits_default_brightness() {
+        // P4 只给色温；亮度从下一档未跳过 claim（P5 0.85）继承，而不是 unwrap_or(1.0)
+        let mut r = Resolver::new();
+        r.set_claims(claims_for(
+            "D1",
+            vec![Claim::default_preset(4500, 0.85), Claim::day_night(3400)],
+        ));
+        let t = r.resolve("D1");
+        assert_eq!(t.ramp(), build_ramp(3400, 0.85, 0.35));
+        assert_ne!(t.ramp(), build_ramp(3400, 1.0, 0.35));
+    }
+
+    #[test]
+    fn daynight_inherits_nondefault_brightness_from_lower_claim() {
+        let mut r = Resolver::new();
+        r.set_claims(claims_for(
+            "D1",
+            vec![Claim::default_preset(4500, 0.7), Claim::day_night(3400)],
+        ));
+        let t = r.resolve("D1");
+        assert_eq!(t.ramp(), build_ramp(3400, 0.7, 0.35));
+    }
+
+    #[test]
+    fn unset_brightness_falls_back_to_085() {
+        let mut r = Resolver::new();
+        r.set_claims(claims_for("D1", vec![Claim::day_night(3400)]));
+        let t = r.resolve("D1");
+        assert_eq!(t.ramp(), build_ramp(3400, 0.85, 0.35));
+    }
+
+    #[test]
+    fn p1_does_not_merge_lower_claim_into_ramp() {
+        let mut r = Resolver::new();
+        r.set_claims(claims_for(
+            "D1",
+            vec![Claim::safe_bypass(), Claim::default_preset(4500, 0.85)],
+        ));
+        let t = r.resolve("D1");
+        assert!(t.is_identity);
+        assert_eq!(t.ramp(), Ramp::identity());
     }
 
     #[test]
@@ -295,7 +358,7 @@ mod tests {
         let ramp = t.ramp();
         assert!(!ramp.is_identity());
         let id_ramp = Ramp::identity();
-        // floor 0.35 对低灰度抬升 + blue 通道 0.981 → 总偏差 < 8%
+        // 6500K / 1.0 接近 identity；blue 通道 Tanner ≈ 0.981 → 总偏差 < 8%
         assert!(ramp.mean_abs_diff(&id_ramp) < 0.08);
     }
 }

@@ -185,6 +185,62 @@ mod tests {
         assert_eq!(d2.breaks_policy, BreaksPolicy::Keep);
     }
 
+    fn scene_with_confidence(
+        process: Option<&str>,
+        fullscreen: bool,
+        confidence: FullscreenConfidence,
+    ) -> SceneSnapshot {
+        SceneSnapshot {
+            process_name: process.map(String::from),
+            path_suffix: None,
+            bundle_id: None,
+            app_display_name: process.unwrap_or("X").to_string(),
+            window_title: None,
+            is_fullscreen: fullscreen,
+            fullscreen_confidence: confidence,
+            display_id: None,
+        }
+    }
+
+    #[test]
+    fn gaming_fullscreen_requires_high_confidence() {
+        let engine = engine_with(builtin_templates());
+        // 最大化 Medium 不得命中 gaming-fullscreen
+        let d = decide(
+            &engine,
+            Some(&scene_with_confidence(
+                Some("game.exe"),
+                true,
+                FullscreenConfidence::Medium,
+            )),
+            &None,
+        );
+        assert!(!d.filter_paused);
+        assert_eq!(d.breaks_policy, BreaksPolicy::Keep);
+        assert!(
+            d.matched
+                .as_ref()
+                .is_none_or(|m| m.rule.id != "gaming-fullscreen")
+        );
+
+        // 无边框 High 命中
+        let d2 = decide(
+            &engine,
+            Some(&scene_with_confidence(
+                Some("game.exe"),
+                true,
+                FullscreenConfidence::High,
+            )),
+            &None,
+        );
+        assert!(d2.filter_paused);
+        assert_eq!(d2.breaks_policy, BreaksPolicy::NotifyOnly);
+        assert_eq!(
+            d2.matched.as_ref().map(|m| m.rule.id.as_str()),
+            Some("gaming-fullscreen")
+        );
+    }
+
     #[test]
     fn preset_rule_produces_p3() {
         let engine = engine_with(builtin_templates());
