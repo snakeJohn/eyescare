@@ -551,7 +551,7 @@ mod tests {
         // 壳层 1s 一拍：一次 pump 覆盖 500ms 过渡
         svc.pump().unwrap();
         let last = backend.last_ramp().unwrap();
-        let target = build_ramp(5500, 1.0, 0.35);
+        let target = build_ramp(5500, 0.85, 0.35);
         assert!(last.mean_abs_diff(&target) < 0.01, "should converge to target");
         assert!(last.mean_abs_diff(&first) > 0.01, "should have moved");
     }
@@ -563,7 +563,7 @@ mod tests {
         svc.recompute().unwrap();
         svc.set_source("daynight", vec![("D1".into(), Claim::day_night(5500))]);
         svc.recompute().unwrap();
-        let dest = build_ramp(5500, 1.0, 0.35);
+        let dest = build_ramp(5500, 0.85, 0.35);
         let stored = svc.current_targets().get("D1").cloned().unwrap();
         assert!(
             stored.mean_abs_diff(&dest) < 0.01,
@@ -594,7 +594,7 @@ mod tests {
             !svc.is_animating(),
             "same destination must not reset animation progress"
         );
-        let dest = build_ramp(5500, 1.0, 0.35);
+        let dest = build_ramp(5500, 0.85, 0.35);
         assert!(backend.last_ramp().unwrap().mean_abs_diff(&dest) < 0.01);
     }
 }
