@@ -20,17 +20,14 @@ jobs:
           test -n "$ZIP"
           mkdir -p /tmp/src
           unzip -o "$ZIP" -d /tmp/src
-          # 不要把压缩包里的 .git 盖掉当前仓库
           if [ -f /tmp/src/Cargo.toml ]; then
             SRC=/tmp/src
           else
             SRC=$(find /tmp/src -mindepth 1 -maxdepth 1 -type d | head -n1)
           fi
           echo "SRC=$SRC"
-          rsync -a --exclude='.git' --exclude='*.zip' "$SRC"/ ./
-          ls -la
+          rsync -a --exclude='.git' --exclude='*.zip' --exclude='.github/workflows' "$SRC"/ ./
           test -f Cargo.toml
-          test -f .github/workflows/ci.yml
 
       - name: Commit and push
         run: |
