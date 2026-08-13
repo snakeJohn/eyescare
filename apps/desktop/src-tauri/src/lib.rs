@@ -5,7 +5,7 @@
 //! - 主循环（1s）：display pump、SafeMode tick、Timer tick（idle 暂停）、
 //!   Scene 采样（750ms）→ RuleEngine 决策 → SafeMode/claims/breaks 联动、
 //!   DayNight 计算、Insights heartbeat/rollup
-//! - 崩溃/退出恢复：panic hook + CloseRequested restore_all
+//! - 崩溃/退出恢复：panic hook + RunEvent::Exit / 会话结束 restore_all
 //!
 //! 注意：本 crate 需 Windows 真机（或带 webkit2gtk 的环境）完整构建；
 //! CI windows-latest 验证。core 逻辑全部在 eyescare-core，独立测试。
@@ -175,6 +175,7 @@ fn apply_preset(state: &State<'_, AppState>, preset: String) -> Result<(), Strin
 #[tauri::command]
 fn restore_display(state: State<'_, AppState>) -> Result<(), String> {
     state.filter_enabled.store(false, Ordering::Relaxed);
+    *lock_mutex(&state.last_daynight_kelvin) = None;
     state.display.restore_all().map_err(|e| e.to_string())
 }
 
@@ -289,15 +290,49 @@ fn set_timer_config(state: State<'_, AppState>, config: TimerConfig) -> Result<(
 
 #[tauri::command]
 fn set_day_night_config(state: State<'_, AppState>, config: DayNightConfig) -> Result<(), String> {
+    day_night_valid(&config)?;
     {
         let mut cfg = state.config.lock().unwrap();
         cfg.display.day_night = config;
         state.store.save_config(&cfg).map_err(|e| e.to_string())?;
     }
-    // 立即重算昼夜
-    update_daynight_claims(&state);
-    let _ = state.display.recompute();
+    // 立即重算昼夜（滤镜关闭时不回写 ramp）
+    if state.filter_enabled.load(Ordering::Relaxed) {
+        update_daynight_claims(&state);
+        let _ = state.display.recompute();
+    }
     Ok(())
+}
+
+/// 与 `AppConfig::validated` 的 day_night 字段规则一致。
+fn day_night_valid(cfg: &DayNightConfig) -> Result<(), String> {
+    if cfg.transition_minutes == 0 {
+        return Err("day_night.transition_minutes must be > 0".into());
+    }
+    if !day_night_hhmm(&cfg.day_start) {
+        return Err(format!(
+            "day_night.day_start must be HH:MM, got {:?}",
+            cfg.day_start
+        ));
+    }
+    if !day_night_hhmm(&cfg.night_start) {
+        return Err(format!(
+            "day_night.night_start must be HH:MM, got {:?}",
+            cfg.night_start
+        ));
+    }
+    Ok(())
+}
+
+fn day_night_hhmm(s: &str) -> bool {
+    let mut it = s.split(':');
+    let (Some(h), Some(m), None) = (it.next(), it.next(), it.next()) else {
+        return false;
+    };
+    let (Ok(h), Ok(m)) = (h.parse::<u32>(), m.parse::<u32>()) else {
+        return false;
+    };
+    h < 24 && m < 60
 }
 
 /// 多屏模式切换（Sync/PerDisplay）。
@@ -432,10 +467,10 @@ fn tick_once(app: &AppHandle) {
     // 3) 前台采样 + 场景决策（主循环 1s 粒度；设计 750ms 节拍，壳层 1s tick 即最密节拍）
     scene_step(app, &state);
 
-    // 4) DayNight（30s 节拍）
+    // 4) DayNight（30s 节拍；滤镜关闭时不得回写）
     {
         let mut acc = state.heartbeat_acc.lock().unwrap();
-        if *acc % 30 == 0 {
+        if filter_on && *acc % 30 == 0 {
             update_daynight_claims(&state);
         }
         *acc += 1;
@@ -579,6 +614,9 @@ fn apply_safe_claims(state: &State<'_, AppState>) {
 
 /// DayNight P4 claim 更新（目标变化才 recompute）。
 fn update_daynight_claims(state: &State<'_, AppState>) {
+    if !state.filter_enabled.load(Ordering::Relaxed) {
+        return;
+    }
     let cfg = state.config.lock().unwrap();
     let dn = &cfg.display.day_night;
     if !dn.enabled {
@@ -598,6 +636,11 @@ fn update_daynight_claims(state: &State<'_, AppState>) {
             .iter()
             .map(|id| (id.clone(), Claim::day_night(k)))
             .collect();
+        // 退出/关闭滤镜可能发生在计算途中，落盘前再确认一次
+        if !state.filter_enabled.load(Ordering::Relaxed) {
+            *last = None;
+            return;
+        }
         state.display.set_source("daynight", claims);
         let _ = state.display.recompute();
     }
@@ -774,9 +817,21 @@ fn set_filter(app: &AppHandle, state: &State<'_, AppState>, enabled: bool) {
     if enabled {
         reapply_display_sources(state);
     } else {
+        *lock_mutex(&state.last_daynight_kelvin) = None;
         let _ = state.display.restore_all();
     }
     emit_status(app, state);
+}
+
+/// 退出：先关滤镜挡住 tick 回写，再标 quitting，再还原 gamma。
+fn begin_quit(app: &AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        state.filter_enabled.store(false, Ordering::Relaxed);
+        *lock_mutex(&state.last_daynight_kelvin) = None;
+        state.quitting.store(true, Ordering::Relaxed);
+        let _ = state.display.restore_all();
+    }
+    app.exit(0);
 }
 
 fn reapply_display_sources(state: &State<'_, AppState>) {
@@ -876,12 +931,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                 let state = app.state::<AppState>();
                 set_filter(app, &state, false);
             }
-            "quit" => {
-                let state = app.state::<AppState>();
-                state.quitting.store(true, Ordering::Relaxed);
-                let _ = state.display.restore_all();
-                app.exit(0);
-            }
+            "quit" => begin_quit(app),
             _ => {}
         })
         .build(app)?;
@@ -1030,22 +1080,14 @@ pub fn run() {
             };
             app.manage(state);
 
-            // 初始 claims：默认预设 + DayNight
+            // 初始 claims：默认 + 手动锁（若有）+ 旁路 + DayNight
             {
                 let st = app.state::<AppState>();
-                if let Ok(displays) = display_backend.list_displays() {
-                    let ids: Vec<String> = displays.iter().map(|d| d.id.0.clone()).collect();
-                    let cfg = st.config.lock().unwrap();
-                    let (k, b) = preset_params(&cfg.display.preset, &cfg);
-                    let claims: Vec<(String, Claim)> = ids
-                        .iter()
-                        .map(|id| (id.clone(), Claim::default_preset(k, b)))
-                        .collect();
-                    st.display.set_source("default", claims);
-                }
-                update_daynight_claims(&st);
-                let _ = st.display.recompute();
+                reapply_display_sources(&st);
             }
+
+            #[cfg(target_os = "windows")]
+            install_session_end_hook(app.handle());
 
             let _ = build_tray(app.handle());
             let handle = app.handle().clone();
@@ -1081,21 +1123,104 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building EyesCare")
         .run(|app_handle, event| {
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                let quitting = app_handle
-                    .try_state::<AppState>()
-                    .map(|s| s.quitting.load(Ordering::Relaxed))
-                    .unwrap_or(false);
-                if !quitting {
-                    // 关掉设置窗不应退出托盘进程
-                    api.prevent_exit();
-                    return;
+            match event {
+                tauri::RunEvent::ExitRequested { api, .. } => {
+                    let quitting = app_handle
+                        .try_state::<AppState>()
+                        .map(|s| s.quitting.load(Ordering::Relaxed))
+                        .unwrap_or(false);
+                    if !quitting {
+                        // 关掉设置窗不应退出托盘进程
+                        api.prevent_exit();
+                    }
                 }
-                if let Some(state) = app_handle.try_state::<AppState>() {
-                    let _ = state.display.restore_all();
+                tauri::RunEvent::Exit => {
+                    // 进程真正拆除：无论路径都必须还原 gamma
+                    if let Some(state) = app_handle.try_state::<AppState>() {
+                        state.filter_enabled.store(false, Ordering::Relaxed);
+                        let _ = state.display.restore_all();
+                    }
                 }
+                _ => {}
             }
         });
+}
+
+/// 隐藏顶层窗接收注销/关机（WM_QUERYENDSESSION / WM_ENDSESSION）。
+#[cfg(target_os = "windows")]
+fn install_session_end_hook(app: &AppHandle) {
+    use windows::core::w;
+    use windows::Win32::Foundation::{HINSTANCE, HWND};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, SetWindowLongPtrW, GWLP_WNDPROC, HMENU, WINDOW_EX_STYLE, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_POPUP,
+    };
+
+    *lock_mutex(&SESSION_APP) = Some(app.clone());
+
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0),
+            w!("STATIC"),
+            w!("EyesCareSessionHook"),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            HWND::default(),
+            HMENU::default(),
+            HINSTANCE::default(),
+            None,
+        )
+    };
+    let hwnd = match hwnd {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!("session-end hook window failed: {e}");
+            return;
+        }
+    };
+    let prev = unsafe {
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, session_wndproc as *const () as isize)
+    };
+    SESSION_ORIG_WNDPROC.store(prev, Ordering::Relaxed);
+}
+
+#[cfg(target_os = "windows")]
+static SESSION_APP: Mutex<Option<AppHandle>> = Mutex::new(None);
+#[cfg(target_os = "windows")]
+static SESSION_ORIG_WNDPROC: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn session_wndproc(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::LRESULT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallWindowProcW, DefWindowProcW, WM_ENDSESSION, WM_QUERYENDSESSION, WNDPROC,
+    };
+
+    let ending = msg == WM_QUERYENDSESSION || (msg == WM_ENDSESSION && wparam.0 != 0);
+    if ending {
+        if let Some(app) = lock_mutex(&SESSION_APP).clone() {
+            begin_quit(&app);
+        }
+        if msg == WM_QUERYENDSESSION {
+            return LRESULT(1);
+        }
+    }
+    let prev = SESSION_ORIG_WNDPROC.load(Ordering::Relaxed);
+    if prev == 0 {
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    } else {
+        let func: WNDPROC = unsafe { std::mem::transmute(prev) };
+        unsafe { CallWindowProcW(func, hwnd, msg, wparam, lparam) }
+    }
 }
 
 // ---------- 非 Windows 占位后端 ----------
@@ -1167,5 +1292,53 @@ impl SystemBackend for NoopSystem {
         _cb: eyescare_platform::EventCallback,
     ) -> eyescare_platform::Result<eyescare_platform::Subscription> {
         Ok(eyescare_platform::Subscription::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{day_night_hhmm, day_night_valid};
+    use eyescare_core::config::DayNightConfig;
+
+    fn valid_dn() -> DayNightConfig {
+        DayNightConfig {
+            enabled: true,
+            transition_minutes: 60,
+            mode: Default::default(),
+            day_start: "07:00".into(),
+            night_start: "19:30".into(),
+        }
+    }
+
+    #[test]
+    fn day_night_valid_accepts_defaults() {
+        assert!(day_night_valid(&valid_dn()).is_ok());
+    }
+
+    #[test]
+    fn day_night_valid_rejects_zero_transition() {
+        let mut c = valid_dn();
+        c.transition_minutes = 0;
+        let err = day_night_valid(&c).unwrap_err();
+        assert!(err.contains("transition_minutes"));
+    }
+
+    #[test]
+    fn day_night_valid_rejects_bad_hhmm() {
+        let mut c = valid_dn();
+        c.day_start = "25:00".into();
+        assert!(day_night_valid(&c).is_err());
+        c = valid_dn();
+        c.day_start = "07:60".into();
+        assert!(day_night_valid(&c).is_err());
+        c = valid_dn();
+        c.day_start = "7:30".into();
+        assert!(day_night_valid(&c).is_ok());
+        c = valid_dn();
+        c.night_start = "ab:cd".into();
+        assert!(day_night_valid(&c).is_err());
+        assert!(!day_night_hhmm(""));
+        assert!(day_night_hhmm("00:00"));
+        assert!(day_night_hhmm("23:59"));
     }
 }
