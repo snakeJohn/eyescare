@@ -18,9 +18,9 @@ use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
-    TranslateMessage, HMENU, HWND_MESSAGE, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_POWERBROADCAST, WM_WTSSESSION_CHANGE, WNDCLASSW,
-    WTS_SESSION_UNLOCK,
+    TranslateMessage, HMENU, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, WINDOW_EX_STYLE,
+    WM_POWERBROADCAST, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_POPUP, WTS_SESSION_UNLOCK,
 };
 
 /// 自启注册表路径（HKCU Run 键，MVP 不需要管理员）。
@@ -220,17 +220,18 @@ fn run_power_session_loop(cb: SharedEventCb) {
         let _ = RegisterClassW(&wc);
     }
 
+    // 顶层隐藏窗：WM_POWERBROADCAST 不会投递给 HWND_MESSAGE。
     let hwnd = match unsafe {
         CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            WINDOW_EX_STYLE(WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0),
             PCWSTR(class_name.as_ptr()),
             PCWSTR::null(),
-            WINDOW_STYLE(0),
+            WS_POPUP,
             0,
             0,
             0,
             0,
-            HWND_MESSAGE,
+            HWND::default(),
             HMENU::default(),
             HINSTANCE::default(),
             None,
@@ -238,7 +239,7 @@ fn run_power_session_loop(cb: SharedEventCb) {
     } {
         Ok(h) => h,
         Err(e) => {
-            tracing::warn!("CreateWindowExW(HWND_MESSAGE) failed: {e}");
+            tracing::warn!("CreateWindowExW(power/session) failed: {e}");
             return;
         }
     };
@@ -275,5 +276,28 @@ mod tests {
         let got = idle_secs(100, last);
         assert_ne!(got, 0, "wrap must not collapse to 0");
         assert!(got < 5, "wrap idle should be ~1s, got {got}");
+    }
+
+    #[test]
+    fn power_resume_and_unlock_map_from_win_msg() {
+        use super::system_event_from_win_msg;
+        use eyescare_platform::SystemEvent;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, WM_POWERBROADCAST, WM_WTSSESSION_CHANGE,
+            WTS_SESSION_UNLOCK,
+        };
+        assert_eq!(
+            system_event_from_win_msg(WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC as usize),
+            Some(SystemEvent::PowerResumed)
+        );
+        assert_eq!(
+            system_event_from_win_msg(WM_POWERBROADCAST, PBT_APMRESUMESUSPEND as usize),
+            Some(SystemEvent::PowerResumed)
+        );
+        assert_eq!(
+            system_event_from_win_msg(WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK as usize),
+            Some(SystemEvent::SessionUnlocked)
+        );
+        assert_eq!(system_event_from_win_msg(WM_POWERBROADCAST, 0), None);
     }
 }

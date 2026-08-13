@@ -9,6 +9,7 @@
 //! 平台后端通过 `DisplayBackend` trait 注入，单测用 MockBackend。
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use eyescare_platform::{ApplyOutcome, ApplyReport, DisplayBackend, DisplayId, Ramp};
@@ -55,6 +56,8 @@ pub struct DisplayService {
     animating: Mutex<BTreeMap<String, (Ramp, Ramp, f64)>>, // (from, to, progress)
     /// 过渡时长 ms（P1 退出/常规微调）。
     transition_ms: u64,
+    /// restore_all / 关滤镜后禁止 apply，避免 tick 回写。
+    applies_enabled: AtomicBool,
 }
 
 impl DisplayService {
@@ -67,7 +70,12 @@ impl DisplayService {
             target: Mutex::new(BTreeMap::new()),
             animating: Mutex::new(BTreeMap::new()),
             transition_ms: 500,
+            applies_enabled: AtomicBool::new(true),
         }
+    }
+
+    pub fn set_applies_enabled(&self, on: bool) {
+        self.applies_enabled.store(on, Ordering::Relaxed);
     }
 
     /// 强制刷新显示器枚举缓存（启动、WM_DISPLAYCHANGE、rebind 后调用）。
@@ -138,6 +146,9 @@ impl DisplayService {
 
             // P0/P1 identity：restore 启动快照，不写 identity ramp（设计 §4.6）
             if t.is_identity {
+                if !self.applies_enabled.load(Ordering::Relaxed) {
+                    continue;
+                }
                 self.backend.restore(&DisplayId(t.display_id.clone()))?;
                 self.target
                     .lock()
@@ -227,11 +238,20 @@ impl DisplayService {
             // pump 只更新 current；target 保持动画终点
             if report.outcome == ApplyOutcome::Applied {
                 self.current.lock().unwrap().insert(id.clone(), ramp.clone());
-            }
-            if new_progress >= 1.0 {
-                finished.push(id.clone());
+                if new_progress >= 1.0 {
+                    finished.push(id.clone());
+                } else {
+                    self.animating
+                        .lock()
+                        .unwrap()
+                        .insert(id.clone(), (from, to, new_progress));
+                }
             } else {
-                self.animating.lock().unwrap().insert(id.clone(), (from, to, new_progress));
+                // Rejected / skip：保持动画，下次 pump 重试（不得把终点当成已落地）
+                self.animating.lock().unwrap().insert(
+                    id.clone(),
+                    (from, to, progress.min(0.999)),
+                );
             }
             self.classify(&mut summary, report);
         }
@@ -242,6 +262,14 @@ impl DisplayService {
     }
 
     fn apply_one(&self, id: &str, ramp: &Ramp) -> Result<ApplyReport, DisplayServiceError> {
+        if !self.applies_enabled.load(Ordering::Relaxed) {
+            return Ok(ApplyReport {
+                display_id: DisplayId(id.to_string()),
+                outcome: ApplyOutcome::Rejected,
+                readback_diff: 0.0,
+                readback_vs_original_diff: 0.0,
+            });
+        }
         // HDR 屏由 backend 返回 HdrSkipped；后端负责策略
         let report = self
             .backend
@@ -262,6 +290,7 @@ impl DisplayService {
 
     /// 恢复全部屏到启动快照（托盘「恢复显示」/退出钩子）。
     pub fn restore_all(&self) -> Result<(), DisplayServiceError> {
+        self.applies_enabled.store(false, Ordering::Relaxed);
         self.backend.restore_all()?;
         self.sources.lock().unwrap().clear();
         self.animating.lock().unwrap().clear();
@@ -488,6 +517,40 @@ mod tests {
     }
 
     #[test]
+    fn rejected_pump_keeps_anim_and_retries() {
+        let (svc, backend) = svc();
+        svc.set_source("daynight", vec![("D1".into(), Claim::day_night(3400))]);
+        svc.recompute().unwrap();
+        svc.set_source("daynight", vec![("D1".into(), Claim::day_night(5500))]);
+        svc.recompute().unwrap();
+        backend.set_fail(true);
+        let s1 = svc.pump().unwrap();
+        assert_eq!(s1.rejected.len(), 1);
+        assert!(svc.is_animating(), "rejected pump must not settle animation");
+        let n1 = backend.applied_count();
+        let s2 = svc.pump().unwrap();
+        assert_eq!(s2.rejected.len(), 0);
+        assert!(backend.applied_count() > n1);
+        assert!(!svc.is_animating());
+    }
+
+    #[test]
+    fn restore_all_blocks_later_apply() {
+        let (svc, backend) = svc();
+        svc.set_source("daynight", vec![("D1".into(), Claim::day_night(3400))]);
+        svc.recompute().unwrap();
+        let n = backend.applied_count();
+        svc.restore_all().unwrap();
+        svc.set_source("daynight", vec![("D1".into(), Claim::day_night(5500))]);
+        let _ = svc.recompute().unwrap();
+        assert_eq!(
+            backend.applied_count(),
+            n,
+            "apply after restore_all must no-op until re-enabled"
+        );
+    }
+
+    #[test]
     fn remove_source_falls_back_to_default() {
         let (svc, backend) = svc();
         svc.set_source("daynight", vec![("D1".into(), Claim::day_night(3400))]);
@@ -509,7 +572,8 @@ mod tests {
         svc.restore_all().unwrap();
         assert!(svc.current_targets().is_empty());
         let restore_n = backend.restore_count();
-        // 恢复后再 recompute：无 claims → 各屏 restore
+        // restore_all 会禁止后续 apply；重新打开滤镜时再允许
+        svc.set_applies_enabled(true);
         let summary = svc.recompute().unwrap();
         assert!(backend.restore_count() >= restore_n + 2);
         assert_eq!(summary.applied.len(), 2);

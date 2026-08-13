@@ -14,7 +14,7 @@ pub struct SceneSnapshot {
     pub app_display_name: String,
     pub window_title: Option<String>,
     pub is_fullscreen: bool,
-    /// 全屏置信度（High/Medium/Low/Unknown）——gaming 模板要求 ≥ Medium。
+    /// 全屏置信度（High/Medium/Low/Unknown）——gaming 模板只认 High。
     pub fullscreen_confidence: eyescare_platform::FullscreenConfidence,
     pub display_id: Option<String>,
 }

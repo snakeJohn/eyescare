@@ -117,6 +117,7 @@ fn set_display_params(
         .map(|id| (id.clone(), Claim::user_lock(k, b)))
         .collect();
     state.filter_enabled.store(true, Ordering::Relaxed);
+    state.display.set_applies_enabled(true);
     state.display.set_source("user", claims);
     let _ = state.display.recompute();
     Ok(())
@@ -130,6 +131,7 @@ fn release_manual_lock(state: State<'_, AppState>) -> Result<(), String> {
     state.store.save_config(&cfg).map_err(|e| e.to_string())?;
     drop(cfg);
     state.filter_enabled.store(true, Ordering::Relaxed);
+    state.display.set_applies_enabled(true);
     state.display.remove_source("user");
     let _ = state.display.recompute();
     Ok(())
@@ -156,6 +158,7 @@ fn apply_preset(state: &State<'_, AppState>, preset: String) -> Result<(), Strin
         state.store.save_config(&cfg).map_err(|e| e.to_string())?;
     }
     state.filter_enabled.store(true, Ordering::Relaxed);
+    state.display.set_applies_enabled(true);
     if is_smart {
         state.display.remove_source("user");
         update_daynight_claims(&state);
@@ -593,7 +596,9 @@ fn scene_step(app: &AppHandle, state: &State<'_, AppState>) {
         } else {
             state.display.remove_source("policy_pause");
         }
-        let _ = state.display.recompute();
+        if state.filter_enabled.load(Ordering::Relaxed) {
+            let _ = state.display.recompute();
+        }
     }
 
     *lock_mutex(&state.breaks_policy) = decision.breaks_policy;
@@ -601,13 +606,20 @@ fn scene_step(app: &AppHandle, state: &State<'_, AppState>) {
 
 /// SafeMode P1 claims 同步到 DisplayService。
 fn apply_safe_claims(state: &State<'_, AppState>) {
+    if !state.filter_enabled.load(Ordering::Relaxed) {
+        return;
+    }
     let sm = lock_mutex(&state.safe_mode);
     let ids = display_ids(state);
     let claims = sm.p1_claims(&ids);
+    drop(sm);
     if claims.is_empty() {
         state.display.remove_source("safe");
     } else {
         state.display.set_source("safe", claims);
+    }
+    if !state.filter_enabled.load(Ordering::Relaxed) {
+        return;
     }
     let _ = state.display.recompute();
 }
@@ -628,21 +640,27 @@ fn update_daynight_claims(state: &State<'_, AppState>) {
         dn,
         eyescare_core::display::day_night::now_local(),
     );
-    let mut last = state.last_daynight_kelvin.lock().unwrap();
-    if *last != Some(k) {
-        *last = Some(k);
-        let ids = display_ids(state);
-        let claims: Vec<(String, Claim)> = ids
-            .iter()
-            .map(|id| (id.clone(), Claim::day_night(k)))
-            .collect();
-        // 退出/关闭滤镜可能发生在计算途中，落盘前再确认一次
-        if !state.filter_enabled.load(Ordering::Relaxed) {
-            *last = None;
-            return;
+    let changed = {
+        let last = state.last_daynight_kelvin.lock().unwrap();
+        *last != Some(k)
+    };
+    if !changed {
+        return;
+    }
+    let ids = display_ids(state);
+    let claims: Vec<(String, Claim)> = ids
+        .iter()
+        .map(|id| (id.clone(), Claim::day_night(k)))
+        .collect();
+    if !state.filter_enabled.load(Ordering::Relaxed) {
+        *state.last_daynight_kelvin.lock().unwrap() = None;
+        return;
+    }
+    state.display.set_source("daynight", claims);
+    if let Ok(summary) = state.display.recompute() {
+        if !summary.any_failure() {
+            *state.last_daynight_kelvin.lock().unwrap() = Some(k);
         }
-        state.display.set_source("daynight", claims);
-        let _ = state.display.recompute();
     }
 }
 
@@ -815,12 +833,39 @@ fn reload_config_into_state(state: &State<'_, AppState>) -> Result<(), String> {
 fn set_filter(app: &AppHandle, state: &State<'_, AppState>, enabled: bool) {
     state.filter_enabled.store(enabled, Ordering::Relaxed);
     if enabled {
+        state.display.set_applies_enabled(true);
         reapply_display_sources(state);
     } else {
         *lock_mutex(&state.last_daynight_kelvin) = None;
         let _ = state.display.restore_all();
     }
     emit_status(app, state);
+}
+
+#[cfg(target_os = "windows")]
+static SESSION_FILTER_WAS_ON: AtomicBool = AtomicBool::new(false);
+
+/// 关机查询：只还原 gamma，进程仍在。取消关机时靠 abort_session_end 恢复滤镜。
+#[cfg(target_os = "windows")]
+fn prepare_session_end(app: &AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        let on = state.filter_enabled.load(Ordering::Relaxed);
+        SESSION_FILTER_WAS_ON.store(on, Ordering::Relaxed);
+        state.filter_enabled.store(false, Ordering::Relaxed);
+        *lock_mutex(&state.last_daynight_kelvin) = None;
+        let _ = state.display.restore_all();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn abort_session_end(app: &AppHandle) {
+    if !SESSION_FILTER_WAS_ON.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    if let Some(state) = app.try_state::<AppState>() {
+        state.filter_enabled.store(true, Ordering::Relaxed);
+        reapply_display_sources(&state);
+    }
 }
 
 /// 退出：先关滤镜挡住 tick 回写，再标 quitting，再还原 gamma。
@@ -835,6 +880,7 @@ fn begin_quit(app: &AppHandle) {
 }
 
 fn reapply_display_sources(state: &State<'_, AppState>) {
+    state.display.set_applies_enabled(true);
     let ids = display_ids(state);
     let cfg = lock_mutex(&state.config);
     let (k, b) = preset_params(&cfg.display.preset, &cfg);
@@ -1205,13 +1251,20 @@ unsafe extern "system" fn session_wndproc(
         CallWindowProcW, DefWindowProcW, WM_ENDSESSION, WM_QUERYENDSESSION, WNDPROC,
     };
 
-    let ending = msg == WM_QUERYENDSESSION || (msg == WM_ENDSESSION && wparam.0 != 0);
-    if ending {
+    if msg == WM_QUERYENDSESSION {
+        // 查询阶段只还原 gamma；关机仍可能被取消，不能在这里 exit。
         if let Some(app) = lock_mutex(&SESSION_APP).clone() {
-            begin_quit(&app);
+            prepare_session_end(&app);
         }
-        if msg == WM_QUERYENDSESSION {
-            return LRESULT(1);
+        return LRESULT(1);
+    }
+    if msg == WM_ENDSESSION {
+        if wparam.0 != 0 {
+            if let Some(app) = lock_mutex(&SESSION_APP).clone() {
+                begin_quit(&app);
+            }
+        } else if let Some(app) = lock_mutex(&SESSION_APP).clone() {
+            abort_session_end(&app);
         }
     }
     let prev = SESSION_ORIG_WNDPROC.load(Ordering::Relaxed);
