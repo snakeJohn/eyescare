@@ -53,16 +53,20 @@ impl RuleCondition {
             RuleField::PathSuffix => scene.path_suffix.as_deref(),
             RuleField::AppDisplayName => Some(scene.app_display_name.as_str()),
             RuleField::IsFullscreen => {
+                // 仅 High（无边框/独占）视为规则全屏；最大化 Medium / Unknown 不算。
+                let high_fs = scene.is_fullscreen
+                    && scene.fullscreen_confidence
+                        == eyescare_platform::FullscreenConfidence::High;
                 return match self.op {
                     RuleOp::Equals => {
-                        self.value.eq_ignore_ascii_case(if scene.is_fullscreen {
+                        self.value.eq_ignore_ascii_case(if high_fs {
                             "true"
                         } else {
                             "false"
                         })
                     }
                     _ => false,
-                }
+                };
             }
         };
         let Some(h) = haystack else {
@@ -414,7 +418,28 @@ mod tests {
             app_display_name: "X".into(),
             window_title: None,
             is_fullscreen: fullscreen,
-            fullscreen_confidence: eyescare_platform::FullscreenConfidence::Unknown,
+            fullscreen_confidence: if fullscreen {
+                eyescare_platform::FullscreenConfidence::High
+            } else {
+                eyescare_platform::FullscreenConfidence::Unknown
+            },
+            display_id: None,
+        }
+    }
+
+    fn scene_fs(
+        process: Option<&str>,
+        fullscreen: bool,
+        confidence: eyescare_platform::FullscreenConfidence,
+    ) -> SceneSnapshot {
+        SceneSnapshot {
+            process_name: process.map(String::from),
+            bundle_id: None,
+            path_suffix: None,
+            app_display_name: "X".into(),
+            window_title: None,
+            is_fullscreen: fullscreen,
+            fullscreen_confidence: confidence,
             display_id: None,
         }
     }
@@ -494,6 +519,48 @@ mod tests {
         };
         assert!(c.matches(&scene(None, None, true)));
         assert!(!c.matches(&scene(None, None, false)));
+    }
+
+    #[test]
+    fn maximized_medium_is_not_rule_fullscreen() {
+        use eyescare_platform::FullscreenConfidence::{High, Medium, Unknown};
+        let is_fs = RuleCondition {
+            field: RuleField::IsFullscreen,
+            op: RuleOp::Equals,
+            value: "true".into(),
+            case_sensitive: false,
+        };
+        let not_fs = RuleCondition {
+            field: RuleField::IsFullscreen,
+            op: RuleOp::Equals,
+            value: "false".into(),
+            case_sensitive: false,
+        };
+        // 最大化 Medium / 未知 不算规则全屏
+        assert!(!is_fs.matches(&scene_fs(None, true, Medium)));
+        assert!(not_fs.matches(&scene_fs(None, true, Medium)));
+        assert!(not_fs.matches(&scene_fs(None, true, Unknown)));
+        // 无边框 High 才算
+        assert!(is_fs.matches(&scene_fs(None, true, High)));
+        assert!(!not_fs.matches(&scene_fs(None, true, High)));
+    }
+
+    #[test]
+    fn gaming_fullscreen_high_only() {
+        use eyescare_platform::FullscreenConfidence::{High, Medium};
+        let engine = RuleEngine::new(builtin_templates());
+        let maximized = engine.first_match(&scene_fs(Some("game.exe"), true, Medium));
+        assert!(
+            maximized
+                .as_ref()
+                .is_none_or(|m| m.rule.id != "gaming-fullscreen"),
+            "maximized Medium must not match gaming-fullscreen"
+        );
+        let borderless = engine.first_match(&scene_fs(Some("game.exe"), true, High));
+        assert_eq!(
+            borderless.as_ref().map(|m| m.rule.id.as_str()),
+            Some("gaming-fullscreen")
+        );
     }
 
     #[test]
