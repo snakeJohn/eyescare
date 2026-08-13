@@ -50,19 +50,47 @@ pub enum DayNightMode {
     SunsetTable,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DayNightConfig {
+    #[serde(default = "default_day_night_enabled")]
     pub enabled: bool,
+    #[serde(default = "default_transition_minutes")]
     pub transition_minutes: u32,
     #[serde(default = "default_day_night_mode")]
     pub mode: DayNightMode,
     /// "HH:MM" 24h。
+    #[serde(default = "default_day_start")]
     pub day_start: String,
+    #[serde(default = "default_night_start")]
     pub night_start: String,
 }
 
+fn default_day_night_enabled() -> bool {
+    true
+}
+fn default_transition_minutes() -> u32 {
+    60
+}
 fn default_day_night_mode() -> DayNightMode {
     DayNightMode::CustomTimes
+}
+fn default_day_start() -> String {
+    "07:00".into()
+}
+fn default_night_start() -> String {
+    "19:30".into()
+}
+
+impl Default for DayNightConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_day_night_enabled(),
+            transition_minutes: default_transition_minutes(),
+            mode: default_day_night_mode(),
+            day_start: default_day_start(),
+            night_start: default_night_start(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -121,13 +149,7 @@ impl Default for DisplayConfig {
             multi_monitor: default_multi_monitor(),
             pipeline: default_pipeline(),
             hdr_policy: default_hdr_policy(),
-            day_night: DayNightConfig {
-                enabled: true,
-                transition_minutes: 60,
-                mode: DayNightMode::CustomTimes,
-                day_start: "07:00".into(),
-                night_start: "19:30".into(),
-            },
+            day_night: DayNightConfig::default(),
             per_display: Default::default(),
         }
     }
@@ -452,8 +474,30 @@ mod tests {
         let json = r#"{"schema_version":1}"#;
         let cfg: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.display.kelvin, 4500);
-        assert!(!cfg.display.day_night.enabled || cfg.display.day_night.transition_minutes >= 1);
+        assert!(cfg.display.day_night.enabled);
+        assert_eq!(cfg.display.day_night.transition_minutes, 60);
         assert_eq!(cfg.safe_mode.default_minutes, 15);
+    }
+
+    #[test]
+    fn day_night_default_is_legal() {
+        let dn = DayNightConfig::default();
+        assert!(dn.enabled);
+        assert_eq!(dn.transition_minutes, 60);
+        assert_eq!(dn.mode, DayNightMode::CustomTimes);
+        assert_eq!(dn.day_start, "07:00");
+        assert_eq!(dn.night_start, "19:30");
+        assert_eq!(AppConfig::default().display.day_night, dn);
+        assert!(AppConfig::default().validated().is_ok());
+    }
+
+    #[test]
+    fn day_night_partial_json_fills_legal_defaults() {
+        let dn: DayNightConfig = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert_eq!(dn.transition_minutes, 60);
+        assert_eq!(dn.day_start, "07:00");
+        assert_eq!(dn.night_start, "19:30");
+        assert_eq!(dn.mode, DayNightMode::CustomTimes);
     }
 
     #[test]
