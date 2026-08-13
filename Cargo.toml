@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/eyescare-core",
+    "crates/eyescare-platform",
+    "crates/eyescare-platform-win",
+    "crates/eyescare-platform-mac",
+    "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/eyescare/eyescare"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

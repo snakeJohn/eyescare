@@ -1,0 +1,93 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-surface text-zinc-200 antialiased select-none;
+    overflow: hidden;
+  }
+  /* 输入框允许选中 */
+  input,
+  textarea {
+    @apply select-text;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-xl border border-surface-border bg-surface-card p-4;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium
+      transition-colors disabled:cursor-not-allowed disabled:opacity-40;
+  }
+  .btn-primary {
+    @apply btn bg-brand-500 text-zinc-950 hover:bg-brand-400;
+  }
+  .btn-ghost {
+    @apply btn border border-surface-border bg-surface-raised text-zinc-300 hover:border-zinc-600 hover:text-zinc-100;
+  }
+  .btn-danger {
+    @apply btn border border-red-900/60 bg-red-950/30 text-red-300 hover:bg-red-900/40;
+  }
+  .input {
+    @apply rounded-lg border border-surface-border bg-surface-raised px-2.5 py-1.5 text-sm text-zinc-200
+      outline-none focus:border-brand-500/70;
+  }
+  .label {
+    @apply text-xs font-medium text-zinc-500;
+  }
+  .tab-btn {
+    @apply flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13px] transition-colors;
+  }
+  .tab-btn-active {
+    @apply bg-brand-500/15 text-brand-300;
+  }
+  .tab-btn-idle {
+    @apply text-zinc-400 hover:bg-surface-raised hover:text-zinc-200;
+  }
+}
+
+/* ---------- 滑杆（色温/亮度） ---------- */
+input[type="range"] {
+  @apply h-1.5 w-full cursor-pointer appearance-none rounded-full bg-zinc-700;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  @apply h-4 w-4 rounded-full border-2 border-zinc-950 bg-brand-400 shadow;
+}
+input[type="range"]::-moz-range-thumb {
+  @apply h-4 w-4 rounded-full border-2 border-zinc-950 bg-brand-400;
+}
+
+/* ---------- 滚动条 ---------- */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  @apply rounded-full bg-zinc-700;
+}
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-zinc-600;
+}
+
+/* 数字输入去掉上下箭头（更紧凑） */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}

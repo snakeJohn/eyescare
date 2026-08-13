@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "presets": [
+    { "id": "health",  "name": "健康", "kelvin": 4500, "brightness": 0.85, "note": "默认" },
+    { "id": "normal",  "name": "普通", "kelvin": 6500, "brightness": 1.00 },
+    { "id": "smart",   "name": "智能", "kelvin": "auto", "brightness": "auto", "note": "= DayNight 当前值" },
+    { "id": "office",  "name": "办公", "kelvin": 5500, "brightness": 0.90 },
+    { "id": "gaming",  "name": "游戏", "kelvin": 6500, "brightness": 1.00, "note": "常 pause" },
+    { "id": "night",   "name": "夜间", "kelvin": 3400, "brightness": 0.70 },
+    { "id": "editing", "name": "编辑", "kelvin": 6500, "brightness": 0.95 },
+    { "id": "reading", "name": "阅读", "kelvin": 4000, "brightness": 0.80 }
+  ]
+}

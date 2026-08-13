@@ -1,0 +1,10 @@
+[package]
+name = "eyescare-platform-mac"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eyescare-platform = { path = "../eyescare-platform" }
+
+# MVP-B 对齐；当前 stub 仅占位编译。

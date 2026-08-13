@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "match_policy": "first_match_wins",
+  "rules": [
+    {
+      "id": "design-figma-safe",
+      "name": "设计旁路 · Figma",
+      "if": {
+        "any": [
+          { "field": "process_name", "op": "equals", "value": "Figma.exe" },
+          { "field": "bundle_id", "op": "equals", "value": "com.figma.Desktop" }
+        ]
+      },
+      "then": { "action": "safe_mode", "hold": "while_match" },
+      "enabled_default": false
+    },
+    {
+      "id": "coding-vscode",
+      "name": "编码 · VS Code",
+      "if": {
+        "any": [
+          { "field": "process_name", "op": "equals", "value": "Code.exe" },
+          { "field": "bundle_id", "op": "equals", "value": "com.microsoft.VSCode" }
+        ]
+      },
+      "then": { "action": "preset", "preset": "editing" },
+      "enabled_default": true
+    },
+    {
+      "id": "gaming-fullscreen",
+      "name": "游戏 · 全屏",
+      "if": { "any": [ { "field": "is_fullscreen", "op": "equals", "value": "true" } ] },
+      "then": { "action": "fullscreen_policy", "filter": "pause", "breaks": "notify_only" },
+      "enabled_default": true
+    }
+  ]
+}
