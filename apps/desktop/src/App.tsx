@@ -89,6 +89,7 @@ const DEFAULT_DRAFT: AppConfig = {
   insights: { store_app_display_names: false, retention_days: 90 },
   privacy: { telemetry: false },
   flags: { deep_link: false, chronotype: false },
+  shortcuts: { toggle_filter: "Ctrl+Alt+F", toggle_safe_mode: "Ctrl+Alt+B", start_break: "Ctrl+Alt+R" },
 };
 
 // ---------------------------------------------------------------------------
@@ -238,11 +239,14 @@ function Note({ children }: { children: React.ReactNode }) {
 
 export default function App() {
   const [tab, setTab] = useState<TabId>("display");
+  const [theme, setTheme] = useState<"dark" | "light">(() =>
+    localStorage.getItem("eyescare-theme") === "light" ? "light" : "dark",
+  );
   // 配置导入成功后 +1：强制重挂载配置类 Tab（重新从后端加载）
   const [configRev, setConfigRev] = useState(0);
 
   return (
-    <div className="flex h-full">
+    <div className={`app-theme theme-${theme} flex h-full`}>
       {/* 侧边栏 */}
       <aside className="flex w-48 shrink-0 flex-col border-r border-surface-border bg-surface-card/60 px-3 py-4">
         <div className="mb-5 flex items-center gap-2 px-2">
@@ -267,7 +271,18 @@ export default function App() {
             </button>
           ))}
         </nav>
-        <div className="mt-auto px-2 text-[10px] leading-relaxed text-zinc-600">
+        <button
+          type="button"
+          className="btn-ghost mt-auto w-full text-xs"
+          onClick={() => setTheme((current) => {
+            const next = current === "dark" ? "light" : "dark";
+            localStorage.setItem("eyescare-theme", next);
+            return next;
+          })}
+        >
+          {theme === "dark" ? "切换浅色主题" : "切换深色主题"}
+        </button>
+        <div className="mt-3 px-2 text-[10px] leading-relaxed text-zinc-600">
           {api.isTauri() ? "已连接桌面后端" : "浏览器预览模式（mock）"}
         </div>
       </aside>
@@ -414,7 +429,7 @@ function DisplayTab() {
       } catch (e) {
         push(`写入失败：${(e as Error).message}`, "err");
       }
-    }, 500);
+    }, 250);
   };
 
   // 昼夜配置防抖写入（700ms）
@@ -604,8 +619,8 @@ function DisplayTab() {
               max={10000}
               step={100}
               value={kelvin}
-              onChange={(e) => {
-                const k = Number(e.target.value);
+              onInput={(e) => {
+                const k = Number(e.currentTarget.value);
                 setKelvin(k);
                 setPresetId("custom");
                 scheduleDisplayWrite(k, brightness);
@@ -623,8 +638,8 @@ function DisplayTab() {
               max={100}
               step={1}
               value={Math.round(brightness * 100)}
-              onChange={(e) => {
-                const b = Number(e.target.value) / 100;
+              onInput={(e) => {
+                const b = Number(e.currentTarget.value) / 100;
                 setBrightness(b);
                 setPresetId("custom");
                 scheduleDisplayWrite(kelvin, b);
@@ -738,6 +753,9 @@ function DisplayTab() {
 function RulesTab() {
   const [rules, setRules] = useState<RulesConfig | null>(null);
   const [busy, setBusy] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [newProcess, setNewProcess] = useState("");
+  const [newPreset, setNewPreset] = useState("editing");
   const { push, node } = useToast();
 
   const refresh = useCallback(async () => {
@@ -776,6 +794,34 @@ function RulesTab() {
     } catch (e) {
       push(`保存失败：${(e as Error).message}`, "err");
     }
+  };
+
+  const addRule = async () => {
+    if (!rules || !newProcess.trim()) {
+      push("请填写要匹配的进程名", "err");
+      return;
+    }
+    const next: RulesConfig = {
+      ...rules,
+      rules: [...rules.rules, {
+        id: `custom-${Date.now()}`, name: newName.trim() || newProcess.trim(),
+        enabled_default: true, enabled: true,
+        if_: { any: [{ field: "process_name", op: "equals", value: newProcess.trim() }], all: [] },
+        then: { action: "preset", preset: newPreset },
+      }],
+    };
+    try {
+      await api.saveRules(next);
+      setRules(next); setNewName(""); setNewProcess("");
+      push("规则已添加");
+    } catch (e) { push(`保存失败：${(e as Error).message}`, "err"); }
+  };
+
+  const deleteRule = async (id: string) => {
+    if (!rules) return;
+    const next = { ...rules, rules: rules.rules.filter((rule) => rule.id !== id) };
+    try { await api.saveRules(next); setRules(next); push("规则已删除"); }
+    catch (e) { push(`删除失败：${(e as Error).message}`, "err"); }
   };
 
   const renderActionTag = (a: RuleAction) => {
@@ -830,20 +876,21 @@ function RulesTab() {
                   </div>
                 </div>
                 <Switch checked={!!r.enabled} onChange={(v) => toggleRule(r.id, v)} />
+                <button type="button" className="btn-danger text-xs" onClick={() => deleteRule(r.id)}>删除</button>
               </li>
             ))}
           </ul>
         )}
       </Section>
 
-      <div className="grid grid-cols-2 gap-3">
-        <button type="button" className="btn-ghost" disabled title="MVP-B 提供">
-          ＋ 新增规则（MVP-B）
-        </button>
-        <button type="button" className="btn-ghost" disabled title="MVP-B 提供">
-          － 删除规则（MVP-B）
-        </button>
-      </div>
+      <Section title="新增规则" desc="匹配指定进程名后自动应用预设。">
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+          <Field label="规则名称（可选）"><input className="input w-full" value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="编码模式" /></Field>
+          <Field label="进程名"><input className="input w-full" value={newProcess} onChange={(e) => setNewProcess(e.target.value)} placeholder="Code.exe" /></Field>
+          <Field label="应用预设"><select className="input w-full" value={newPreset} onChange={(e) => setNewPreset(e.target.value)}>{PRESETS.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}</select></Field>
+        </div>
+        <button type="button" className="btn-primary mt-3" onClick={addRule}>＋ 添加规则</button>
+      </Section>
 
       <Note>
         规则匹配依据前台应用身份（进程名 / Bundle ID / 路径后缀 / 全屏状态），全部在本地完成；
@@ -1264,28 +1311,48 @@ function RhythmTab() {
 // ---------------------------------------------------------------------------
 
 function ShortcutsTab() {
+  const [shortcuts, setShortcuts] = useState<api.ShortcutConfig>(DEFAULT_DRAFT.shortcuts);
+  const [saving, setSaving] = useState(false);
+  const { push, node } = useToast();
+
+  useEffect(() => {
+    api.getFullConfig().then((cfg) => setShortcuts(cfg.shortcuts)).catch(() => {});
+  }, []);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await api.setShortcuts(shortcuts);
+      push("快捷键已保存并生效");
+    } catch (e) {
+      push(`快捷键注册失败：${(e as Error).message}`, "err");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const rows: { key: keyof api.ShortcutConfig; label: string }[] = [
+    { key: "toggle_filter", label: "开关滤镜" },
+    { key: "toggle_safe_mode", label: "切换滤镜旁路（取色友好）" },
+    { key: "start_break", label: "开始引导休息" },
+  ];
   return (
     <div className="space-y-4">
-      <Section title="快捷键" desc="通过快捷键快速切换滤镜状态与旁路。">
+      <Section title="全局快捷键" desc="使用 Ctrl+Alt+F 等格式；保存后立即注册，即使设置窗口隐藏也可使用。">
         <div className="space-y-2 text-xs text-zinc-400">
-          <div className="flex justify-between rounded-lg border border-surface-border bg-surface-raised px-3 py-2.5">
-            <span>开关滤镜</span>
-            <span className="text-zinc-600">未分配</span>
-          </div>
-          <div className="flex justify-between rounded-lg border border-surface-border bg-surface-raised px-3 py-2.5">
-            <span>切换滤镜旁路（取色友好）</span>
-            <span className="text-zinc-600">未分配</span>
-          </div>
-          <div className="flex justify-between rounded-lg border border-surface-border bg-surface-raised px-3 py-2.5">
-            <span>开始引导休息</span>
-            <span className="text-zinc-600">未分配</span>
-          </div>
+          {rows.map((row) => (
+            <label key={row.key} className="flex items-center justify-between gap-4 rounded-lg border border-surface-border bg-surface-raised px-3 py-2.5">
+              <span>{row.label}</span>
+              <input className="input w-40 font-mono text-xs" value={shortcuts[row.key]} onChange={(e) => setShortcuts((s) => ({ ...s, [row.key]: e.target.value }))} />
+            </label>
+          ))}
         </div>
+        <button type="button" className="btn-primary mt-3" disabled={saving} onClick={save}>{saving ? "注册中…" : "保存并注册"}</button>
       </Section>
       <Note>
-        MVP-A：使用托盘菜单操作（滤镜开关 / 旁路 / 预设 / 今日遵从率 / 设置 / 恢复显示）。
-        全局快捷键注册将在 MVP-B 提供（tauri-plugin-global-shortcut 已就绪）。
+        若组合键已被系统或另一应用占用，保存会失败且原有配置保持不变。
       </Note>
+      {node}
     </div>
   );
 }

@@ -236,6 +236,15 @@ impl TimerService {
         }
     }
 
+    /// 立即开始一次休息，供用户显式触发的全局快捷键使用。
+    pub fn start_break_now(&mut self) {
+        if !matches!(self.state, TimerState::Break) {
+            self.work_elapsed = Duration::ZERO;
+            self.prebreak_remaining = None;
+            self.start_break();
+        }
+    }
+
     /// 推迟休息一次（snooze = work_sec 的 20%，MVP 固定 5min）。PreBreak 同样可推迟。
     pub fn snooze(&mut self) {
         if matches!(self.state, TimerState::Break | TimerState::PreBreak) && !self.snoozed_once {
@@ -371,6 +380,15 @@ mod tests {
         assert_eq!(t.state(), TimerState::Working);
         let evs = t.drain_events();
         assert!(evs.contains(&TimerEvent::BreakFinished { completed: false }));
+    }
+
+    #[test]
+    fn start_break_now_enters_break_and_emits_start() {
+        let mut t = TimerService::new(cfg(1200, 20));
+        t.start_break_now();
+        assert_eq!(t.state(), TimerState::Break);
+        assert_eq!(t.status().break_remaining_sec, Some(20));
+        assert!(t.drain_events().contains(&TimerEvent::BreakStarted));
     }
 
     #[test]

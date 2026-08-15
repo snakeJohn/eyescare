@@ -27,6 +27,7 @@ use eyescare_core::scene_engine::{self, BreaksPolicy};
 use eyescare_core::timer::{TimerEvent, TimerService};
 use eyescare_platform::{DisplayBackend, ForegroundAppBackend, SystemBackend, SystemEvent};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 /// 锁中毒后仍取出内部值，避免 tick 线程永久停摆。
 fn lock_mutex<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -372,6 +373,88 @@ fn set_hdr_policy(state: State<'_, AppState>, policy: String) -> Result<(), Stri
     Ok(())
 }
 
+/// 保存快捷键配置。全局快捷键由前端插件注册，格式由插件校验。
+#[tauri::command]
+fn set_shortcuts(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    toggle_filter: String,
+    toggle_safe_mode: String,
+    start_break: String,
+) -> Result<(), String> {
+    let values = [&toggle_filter, &toggle_safe_mode, &start_break];
+    if values.iter().any(|v| v.trim().is_empty()) {
+        return Err("shortcut must not be empty".into());
+    }
+    if toggle_filter == toggle_safe_mode
+        || toggle_filter == start_break
+        || toggle_safe_mode == start_break
+    {
+        return Err("shortcuts must be unique".into());
+    }
+    let next = eyescare_core::config::ShortcutConfig {
+        toggle_filter,
+        toggle_safe_mode,
+        start_break,
+    };
+    let previous = lock_mutex(&state.config).shortcuts.clone();
+    register_shortcuts(&app, &next)?;
+    let mut cfg = lock_mutex(&state.config);
+    cfg.shortcuts = next;
+    if let Err(error) = state.store.save_config(&cfg) {
+        cfg.shortcuts = previous.clone();
+        drop(cfg);
+        let _ = register_shortcuts(&app, &previous);
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+/// 全局快捷键在 Rust 进程中注册，设置窗口关闭后仍持续有效。
+fn register_shortcuts(
+    app: &AppHandle,
+    shortcuts: &eyescare_core::config::ShortcutConfig,
+) -> Result<(), String> {
+    let manager = app.global_shortcut();
+    manager.unregister_all().map_err(|e| e.to_string())?;
+    for shortcut in [
+        shortcuts.toggle_filter.as_str(),
+        shortcuts.toggle_safe_mode.as_str(),
+        shortcuts.start_break.as_str(),
+    ] {
+        manager
+            .on_shortcut(shortcut, |app, shortcut, event| {
+                if event.state != ShortcutState::Pressed {
+                    return;
+                }
+                let configured = app.state::<AppState>().config.lock().ok().map(|c| c.shortcuts.clone());
+                let Some(configured) = configured else { return };
+                let text = shortcut.to_string();
+                let state = app.state::<AppState>();
+                if text.eq_ignore_ascii_case(&configured.toggle_filter) {
+                    let enabled = !state.filter_enabled.load(Ordering::Relaxed);
+                    set_filter(app, &state, enabled);
+                } else if text.eq_ignore_ascii_case(&configured.toggle_safe_mode) {
+                    let mut safe = lock_mutex(&state.safe_mode);
+                    if safe.is_active() { safe.user_exit(); } else { safe.user_enter(); }
+                    drop(safe);
+                    apply_safe_claims(&state);
+                    emit_status(app, &state);
+                } else if text.eq_ignore_ascii_case(&configured.start_break) {
+                    let events = {
+                        let mut timer = lock_mutex(&state.timer);
+                        timer.start_break_now();
+                        timer.drain_events()
+                    };
+                    for event in events { handle_timer_event(app, &state, event); }
+                    emit_status(app, &state);
+                }
+            })
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 // ---------- 洞察 / 配置命令 ----------
 
 #[tauri::command]
@@ -404,6 +487,19 @@ fn import_config(state: State<'_, AppState>, bundle: ExportBundle) -> Result<Imp
 fn skip_break(app: AppHandle, state: State<'_, AppState>) {
     lock_mutex(&state.timer).skip();
     *lock_mutex(&state.guided) = None;
+    emit_status(&app, &state);
+}
+
+#[tauri::command]
+fn start_guided_break(app: AppHandle, state: State<'_, AppState>) {
+    let events = {
+        let mut timer = lock_mutex(&state.timer);
+        timer.start_break_now();
+        timer.drain_events()
+    };
+    for event in events {
+        handle_timer_event(&app, &state, event);
+    }
     emit_status(&app, &state);
 }
 
@@ -1001,7 +1097,9 @@ fn show_settings(app: &AppHandle) {
     .inner_size(960.0, 680.0)
     .min_inner_size(720.0, 480.0)
     .resizable(true)
-    .visible(true);
+    .visible(true)
+    // 设置页是由托盘打开的临时窗口，避免作为第二个任务栏入口。
+    .skip_taskbar(true);
     #[cfg(target_os = "windows")]
     let builder = builder.additional_browser_args(
         "--disable-background-networking --disable-features=Translate,msSmartScreenProtection --js-flags=--max-old-space-size=64",
@@ -1020,6 +1118,7 @@ pub fn run() {
             show_settings(app);
         }))
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -1042,12 +1141,14 @@ pub fn run() {
             set_day_night_config,
             set_multi_monitor,
             set_hdr_policy,
+            set_shortcuts,
             get_today_summary,
             get_full_config,
             export_config,
             import_config,
             set_filter_enabled,
             skip_break,
+            start_guided_break,
         ])
         // 关闭设置窗即销毁 WebView（释放 50MB+）；进程由托盘保活。
         .setup(|app| {
@@ -1125,6 +1226,10 @@ pub fn run() {
                 last_claim_sig: Mutex::new(None),
             };
             app.manage(state);
+            let shortcuts = app.state::<AppState>().config.lock().unwrap().shortcuts.clone();
+            if let Err(e) = register_shortcuts(app.handle(), &shortcuts) {
+                tracing::warn!("global shortcut registration failed: {e}");
+            }
 
             // 初始 claims：默认 + 手动锁（若有）+ 旁路 + DayNight
             {

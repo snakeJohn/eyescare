@@ -19,6 +19,17 @@
   }
 }
 
+/* 浅色主题：用可读的色彩覆盖固定的深色 Tailwind 表面，内容仍共用同一套组件。 */
+.theme-light {
+  color: #18181b;
+  background: #f8fafc;
+}
+.theme-light .bg-surface, .theme-light .bg-surface-card, .theme-light .bg-surface-card\/60 { background-color: #f8fafc !important; }
+.theme-light .bg-surface-raised, .theme-light .bg-zinc-900, .theme-light .bg-zinc-950 { background-color: #ffffff !important; }
+.theme-light .border-surface-border, .theme-light .border-zinc-800, .theme-light .border-zinc-700 { border-color: #d4d4d8 !important; }
+.theme-light .text-zinc-100, .theme-light .text-zinc-200, .theme-light .text-zinc-300, .theme-light .text-zinc-400 { color: #27272a !important; }
+.theme-light .text-zinc-500, .theme-light .text-zinc-600 { color: #52525b !important; }
+
 @layer components {
   .card {
     @apply rounded-xl border border-surface-border bg-surface-card p-4;

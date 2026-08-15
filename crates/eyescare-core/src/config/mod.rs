@@ -320,6 +320,33 @@ pub struct AppConfig {
     pub privacy: PrivacyConfig,
     #[serde(default)]
     pub flags: FlagsConfig,
+    #[serde(default)]
+    pub shortcuts: ShortcutConfig,
+}
+
+/// 用户可配置的全局快捷键。格式遵循 Tauri global-shortcut，例如 `Ctrl+Alt+F`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShortcutConfig {
+    #[serde(default = "default_toggle_filter_shortcut")]
+    pub toggle_filter: String,
+    #[serde(default = "default_toggle_safe_mode_shortcut")]
+    pub toggle_safe_mode: String,
+    #[serde(default = "default_start_break_shortcut")]
+    pub start_break: String,
+}
+
+fn default_toggle_filter_shortcut() -> String { "Ctrl+Alt+F".into() }
+fn default_toggle_safe_mode_shortcut() -> String { "Ctrl+Alt+B".into() }
+fn default_start_break_shortcut() -> String { "Ctrl+Alt+R".into() }
+
+impl Default for ShortcutConfig {
+    fn default() -> Self {
+        Self {
+            toggle_filter: default_toggle_filter_shortcut(),
+            toggle_safe_mode: default_toggle_safe_mode_shortcut(),
+            start_break: default_start_break_shortcut(),
+        }
+    }
 }
 
 impl Default for AppConfig {
@@ -332,6 +359,7 @@ impl Default for AppConfig {
             insights: InsightsConfig::default(),
             privacy: PrivacyConfig::default(),
             flags: FlagsConfig::default(),
+            shortcuts: ShortcutConfig::default(),
         }
     }
 }
@@ -477,6 +505,9 @@ mod tests {
         assert!(cfg.display.day_night.enabled);
         assert_eq!(cfg.display.day_night.transition_minutes, 60);
         assert_eq!(cfg.safe_mode.default_minutes, 15);
+        assert_eq!(cfg.shortcuts.toggle_filter, "Ctrl+Alt+F");
+        assert_eq!(cfg.shortcuts.toggle_safe_mode, "Ctrl+Alt+B");
+        assert_eq!(cfg.shortcuts.start_break, "Ctrl+Alt+R");
     }
 
     #[test]

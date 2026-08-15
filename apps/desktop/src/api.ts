@@ -154,6 +154,13 @@ export interface AppConfig {
   insights: { store_app_display_names: boolean; retention_days: number };
   privacy: { telemetry: boolean };
   flags: { deep_link: boolean; chronotype: boolean };
+  shortcuts: ShortcutConfig;
+}
+
+export interface ShortcutConfig {
+  toggle_filter: string;
+  toggle_safe_mode: string;
+  start_break: string;
 }
 
 export interface ExportBundle {
@@ -207,6 +214,7 @@ export const restoreDisplay = () => call<void>("restore_display");
 export const setFilterEnabled = (enabled: boolean) =>
   call<void>("set_filter_enabled", { enabled });
 export const skipBreak = () => call<void>("skip_break");
+export const startGuidedBreak = () => call<void>("start_guided_break");
 
 export const setTimerConfig = (config: TimerConfig) =>
   call<void>("set_timer_config", { config });
@@ -216,6 +224,8 @@ export const setMultiMonitor = (mode: "sync" | "per_display") =>
   call<void>("set_multi_monitor", { mode });
 export const setHdrPolicy = (policy: "skip" | "force") =>
   call<void>("set_hdr_policy", { policy });
+export const setShortcuts = (shortcuts: ShortcutConfig) =>
+  call<void>("set_shortcuts", { ...shortcuts });
 
 export const setRuleEnabled = (ruleId: string, enabled: boolean) =>
   call<void>("set_rule_enabled", { ruleId, enabled });
@@ -356,6 +366,7 @@ const MOCK_CONFIG: AppConfig = {
   insights: { store_app_display_names: false, retention_days: 90 },
   privacy: { telemetry: false },
   flags: { deep_link: false, chronotype: false },
+  shortcuts: { toggle_filter: "Ctrl+Alt+F", toggle_safe_mode: "Ctrl+Alt+B", start_break: "Ctrl+Alt+R" },
 };
 
 let mockSafeActive = false;
@@ -409,12 +420,14 @@ async function mockCall<T>(cmd: string, args?: Record<string, unknown>): Promise
     case "set_filter_enabled":
       return undefined as unknown as T;
     case "skip_break":
+    case "start_guided_break":
       return undefined as unknown as T;
     case "get_full_config":
       return MOCK_CONFIG as unknown as T;
     case "set_day_night_config":
     case "set_multi_monitor":
     case "set_hdr_policy":
+    case "set_shortcuts":
     case "set_timer_config":
     case "set_display_params":
     case "release_manual_lock":

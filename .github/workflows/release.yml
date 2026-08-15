@@ -62,6 +62,15 @@ jobs:
           $found | Copy-Item -Destination dist-release -Force
           Get-ChildItem dist-release | Format-Table Name, Length
 
+      - name: Create portable Windows archive
+        shell: pwsh
+        run: |
+          $binary = Get-ChildItem -Path "target/release/eyescare-desktop.exe", "apps/desktop/src-tauri/target/release/eyescare-desktop.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $binary) { throw "Portable executable not found" }
+          $portable = "dist-release/EyesCare-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}-windows-x64-portable.zip"
+          Compress-Archive -Path $binary.FullName -DestinationPath $portable -Force
+          Get-Item $portable | Format-Table Name, Length
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -70,7 +79,7 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
-          files: dist-release/*.exe
+          files: dist-release/*
           body: |
             EyesCare 第一版（v0.1.0）Windows 安装包。
 
@@ -78,4 +87,4 @@ jobs:
             - 安装后从托盘打开设置；退出托盘才会还原 gamma
             - 未签名：SmartScreen 可能提示，选「仍要运行」即可
 
-            资源里是 NSIS 安装包（x64）。
+            资源里同时提供 NSIS 安装包和 Windows x64 免安装 ZIP（解压后直接运行）。
