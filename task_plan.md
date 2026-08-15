@@ -8,7 +8,7 @@
 2. [complete] 编写 macOS 架构与产品设计文档
 3. [complete] 编写按测试驱动拆分的实施计划
 4. [complete] 自审文档、检查 Git 差异并验证内容
-5. [in_progress] 提交并推送 `mac-doc` 分支
+5. [complete] 提交并推送 `mac-doc` 分支
 6. [complete] 汇总子代理对 Windows 代码与免安装构建链路的审查结果
 
 ## 决策
