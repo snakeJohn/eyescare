@@ -1,66 +1,59 @@
-# EyesCare（护眼助手）
+# EyesCare
 
-隐私优先、场景智能的跨平台护眼与节律助手。Windows 10/11 首发（Win-first dogfood），macOS 12+ 并行对齐（MVP-B）。
+EyesCare 是一款隐私优先的桌面护眼与节律助手，当前面向 Windows 10/11。它在本地调节显示色温与亮度，并根据前台应用、全屏状态和用户习惯提供旁路、休息提醒与洞察。
 
-技术栈：Tauri 2 + Rust + React 18 + SQLite。设计文档见 `docs/design.md`（r2 修订版，上传副本存档于 `docs/`）。
+## 功能
 
-## 仓库结构（阶段 1：少 crate，逻辑分模块）
+- 色温与亮度调节：提供预设、手动微调，以及按白天/夜间时间自动切换。
+- 多显示器支持：支持同步模式和按显示器分别配置。
+- HDR 兼容：默认跳过 HDR 显示器的 gamma 调节，也可由用户选择强制应用。
+- 场景规则：基于进程名、应用标识、路径后缀与全屏状态匹配规则，自动切换预设、旁路或休息策略。
+- 滤镜旁路：在取色、设计或其他色彩敏感场景下临时恢复原始显示。
+- 休息提醒：支持普通节律与 20-20-20 模式、空闲暂停、静默提醒和引导式休息。
+- 全局快捷键：可配置滤镜开关、旁路切换与立即开始引导休息的快捷键。
+- 本地洞察：使用本地 SQLite 保存休息与使用情况摘要；默认不上传数据、不启用遥测。
+- 配置管理：配置和规则可导入、导出，并以原子写入方式保存在本机。
+- 托盘常驻：关闭设置窗口不会退出应用；从托盘菜单打开设置或退出应用。
+- 深色与浅色主题：设置页支持在两种主题之间切换，并保留本地偏好。
 
-```
-apps/desktop/            # Tauri 2 + React 壳（托盘/自启/快捷键/Overlay/设置页）
-crates/
-  eyescare-platform/     # 平台 traits + 共享类型（DisplayBackend/ForegroundAppBackend/SystemBackend）
-  eyescare-platform-win/ # Windows 后端（GDI Gamma、前台采样、系统事件）
-  eyescare-platform-mac/ # macOS 后端（占位 stub，MVP-B 对齐）
-  eyescare-core/         # 纯逻辑：config/display/safe_mode/scene/rules/timer/guided/insights
-assets/guided/           # 引导休息资源（CC0，≤1.5MB）
-docs/                    # 设计文档 + Open Questions + PR 计划
-profiles/templates/      # 内置规则模板（JSON）
-scripts/                 # 开发辅助脚本
-```
+## 本地开发
 
-## 差异化支柱（MVP-A 一等公民）
+前置条件：
 
-1. 场景智能（SceneEngine + RuleEngine + 内置模板）
-2. 滤镜旁路 / 取色友好（SafeMode 状态机，P1 优先级）
-3. 引导式休息（GuidedBreak，可静默）
-4. 本地眼健康洞察（SQLite，90 天保留）
-5. 配置 JSON 导入导出
+- Rust stable（Windows 开发建议安装 MSVC 构建工具）。
+- Node.js 20 或更高版本。
+- Windows 10/11：运行完整桌面应用所需；核心逻辑测试可在其他平台运行。
 
-## PR 状态
-
-| PR | 内容 | 状态 |
-|----|------|------|
-| A01 | 仓库脚手架 + capabilities 最小集 | ✅ |
-| A02 | 配置 schema v1 + 原子持久化 + 迁移 + 导入导出 | ✅ |
-| A03 | 显示算法（kelvin/ramp/lerp/12Hz 限频） | ✅ |
-| A04 | platform-win DisplayBackend | ✅（交叉 check 通过） |
-| A06 | DisplayService + DayNight + Resolver P0–P5 + 紧急恢复 | ✅ |
-| A07 | Shell（托盘/自启/快捷键/单实例） | ✅（真机构建待验证） |
-| A08 | SafeModeController 状态机 | ✅ |
-| A09/A10 | SceneContext + RuleEngine + 内置模板 | ✅ |
-| A13/A14 | Timer 状态机 + 空闲暂停 + GuidedBreakPlayer | ✅ |
-| A16 | Insights SQLite + 采集 + 今日面板 | ✅ |
-
-冻结点：PR-A17（MVP-A ship gate）。
-
-## 开发
+安装前端依赖并启动桌面开发环境：
 
 ```bash
-# 纯逻辑（core/platform）可在任何平台编译测试：
-cargo test -p eyescare-core
-cargo test -p eyescare-platform
-
-# Windows 后端交叉检查（在非 Windows 上）：
-rustup target add x86_64-pc-windows-msvc
-cargo check -p eyescare-platform-win --target x86_64-pc-windows-msvc
-
-# 前端（apps/desktop）
-cd apps/desktop && npm install && npm run tauri dev
+cd apps/desktop
+npm install
+npm run tauri dev
 ```
 
-## 隐私承诺
+构建前端：
 
-- 默认无网络、无遥测。
-- 前台身份默认哈希落库；明文显示名可配置且默认关。
-- 摄像头、屏幕录制、日历权限全部非 MVP。
+```bash
+cd apps/desktop
+npm run build
+```
+
+运行核心逻辑测试：
+
+```bash
+cargo test -p eyescare-core
+```
+
+检查桌面端 Rust 集成：
+
+```bash
+cargo check -p eyescare-desktop
+```
+
+可选：检查 Windows 平台后端：
+
+```bash
+rustup target add x86_64-pc-windows-msvc
+cargo check -p eyescare-platform-win --target x86_64-pc-windows-msvc
+```
