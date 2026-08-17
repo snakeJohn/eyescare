@@ -2,7 +2,7 @@
 // 差异化能力（滤镜旁路 / 场景规则 / 引导休息 / 本地洞察）均为一等公民入口。
 // 所有后端交互走 src/api.ts 的 invoke 封装。
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import * as api from "./api";
 import type {
   AppConfig,
@@ -15,6 +15,20 @@ import type {
   StatusPayload,
   TodaySummary,
 } from "./api";
+import { Field, Note, Section, StatCard, Switch, useToast } from "./ui/kit";
+import {
+  BrandMark,
+  IconAbout,
+  IconBreaks,
+  IconDisplay,
+  IconGeneral,
+  IconInsights,
+  IconMoon,
+  IconRhythm,
+  IconRules,
+  IconShortcuts,
+  IconSun,
+} from "./ui/icons";
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -60,15 +74,15 @@ type TabId =
   | "general"
   | "about";
 
-const TABS: { id: TabId; label: string; icon: string }[] = [
-  { id: "display", label: "显示", icon: "◐" },
-  { id: "rules", label: "场景与规则", icon: "◆" },
-  { id: "breaks", label: "计时与引导休息", icon: "⏱" },
-  { id: "insights", label: "洞察", icon: "◉" },
-  { id: "rhythm", label: "节律", icon: "☾" },
-  { id: "shortcuts", label: "快捷键", icon: "⌨" },
-  { id: "general", label: "通用 / 隐私", icon: "⚙" },
-  { id: "about", label: "关于", icon: "ℹ" },
+const TABS: { id: TabId; label: string; icon: (p: { className?: string }) => ReactNode }[] = [
+  { id: "display", label: "显示", icon: IconDisplay },
+  { id: "rules", label: "场景与规则", icon: IconRules },
+  { id: "breaks", label: "计时与休息", icon: IconBreaks },
+  { id: "insights", label: "洞察", icon: IconInsights },
+  { id: "rhythm", label: "节律", icon: IconRhythm },
+  { id: "shortcuts", label: "快捷键", icon: IconShortcuts },
+  { id: "general", label: "通用 / 隐私", icon: IconGeneral },
+  { id: "about", label: "关于", icon: IconAbout },
 ];
 
 const DEFAULT_DRAFT: AppConfig = {
@@ -133,107 +147,6 @@ function describeAction(a: RuleAction): string {
 }
 
 // ---------------------------------------------------------------------------
-// 小组件
-// ---------------------------------------------------------------------------
-
-function Switch({
-  checked,
-  onChange,
-  disabled,
-}: {
-  checked: boolean;
-  onChange: (v: boolean) => void;
-  disabled?: boolean;
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      className={`relative h-5 w-9 shrink-0 rounded-full transition-colors disabled:opacity-40 ${
-        checked ? "bg-brand-500" : "bg-zinc-700"
-      }`}
-    >
-      <span
-        className={`absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform ${
-          checked ? "translate-x-4" : ""
-        }`}
-      />
-    </button>
-  );
-}
-
-function Section({
-  title,
-  desc,
-  children,
-  className = "",
-}: {
-  title: string;
-  desc?: string;
-  children: React.ReactNode;
-  className?: string;
-}) {
-  return (
-    <section className={`card ${className}`}>
-      <h3 className="text-sm font-semibold text-zinc-100">{title}</h3>
-      {desc && <p className="mt-0.5 text-xs leading-relaxed text-zinc-500">{desc}</p>}
-      <div className="mt-3">{children}</div>
-    </section>
-  );
-}
-
-function Field({
-  label,
-  children,
-  hint,
-}: {
-  label: string;
-  children: React.ReactNode;
-  hint?: string;
-}) {
-  return (
-    <label className="block">
-      <span className="label">{label}</span>
-      <div className="mt-1.5">{children}</div>
-      {hint && <span className="mt-1 block text-[11px] text-zinc-600">{hint}</span>}
-    </label>
-  );
-}
-
-function StatCard({
-  label,
-  value,
-  sub,
-  accent,
-}: {
-  label: string;
-  value: string;
-  sub?: string;
-  accent?: boolean;
-}) {
-  return (
-    <div className={`rounded-xl border p-3.5 ${accent ? "border-brand-500/40 bg-brand-500/10" : "border-surface-border bg-surface-raised"}`}>
-      <div className="text-[11px] text-zinc-500">{label}</div>
-      <div className={`mt-1 text-xl font-semibold ${accent ? "text-brand-300" : "text-zinc-100"}`}>
-        {value}
-      </div>
-      {sub && <div className="mt-0.5 text-[11px] text-zinc-600">{sub}</div>}
-    </div>
-  );
-}
-
-function Note({ children }: { children: React.ReactNode }) {
-  return (
-    <p className="mt-3 rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-[11px] leading-relaxed text-zinc-500">
-      {children}
-    </p>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
@@ -263,61 +176,110 @@ export default function App() {
     };
   }, []);
 
+  const current = TABS.find((t) => t.id === tab);
+  const toggleTheme = () => {
+    setTheme((currentTheme) => {
+      const next = currentTheme === "dark" ? "light" : "dark";
+      localStorage.setItem("eyescare-theme", next);
+      return next;
+    });
+  };
+
   return (
-    <div className={`app-theme theme-${theme} flex h-full`}>
-      {/* 侧边栏 */}
-      <aside className="flex w-48 shrink-0 flex-col border-r border-surface-border bg-surface-card/60 px-3 py-4">
-        <div className="mb-5 flex items-center gap-2 px-2">
-          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-brand-500 text-base font-bold text-zinc-950">
-            E
-          </div>
-          <div>
-            <div className="text-sm font-semibold text-zinc-100">EyesCare</div>
-            <div className="text-[10px] text-zinc-500">
+    <div className={`theme-${theme} flex h-full`} style={{ background: "var(--bg)", color: "var(--fg)" }}>
+      <aside
+        className="flex w-[200px] shrink-0 flex-col border-r px-3 py-4"
+        style={{ background: "var(--card)", borderColor: "var(--line)" }}
+      >
+        <div className="mb-6 flex items-center gap-2.5 px-1.5">
+          <BrandMark className="h-9 w-9 shrink-0" />
+          <div className="min-w-0">
+            <div className="text-sm font-semibold tracking-wide">EyesCare</div>
+            <div className="text-[10px]" style={{ color: "var(--muted)" }}>
               护眼助手{version ? ` · ${version}` : ""}
             </div>
           </div>
         </div>
         <nav className="flex flex-col gap-0.5">
-          {TABS.map((t) => (
-            <button
-              key={t.id}
-              type="button"
-              onClick={() => setTab(t.id)}
-              className={`tab-btn ${tab === t.id ? "tab-btn-active" : "tab-btn-idle"}`}
-            >
-              <span className="w-4 text-center text-sm">{t.icon}</span>
-              {t.label}
-            </button>
-          ))}
-        </nav>
-        <button
-          type="button"
-          className="btn-ghost mt-auto w-full text-xs"
-          onClick={() => setTheme((current) => {
-            const next = current === "dark" ? "light" : "dark";
-            localStorage.setItem("eyescare-theme", next);
-            return next;
+          {TABS.map((t) => {
+            const active = tab === t.id;
+            const Glyph = t.icon;
+            return (
+              <button
+                key={t.id}
+                type="button"
+                onClick={() => setTab(t.id)}
+                className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] transition-colors"
+                style={{
+                  background: active ? "color-mix(in srgb, var(--accent) 18%, transparent)" : "transparent",
+                  color: active ? "var(--accent)" : "var(--muted)",
+                }}
+              >
+                <Glyph className="h-4 w-4 shrink-0" />
+                {t.label}
+              </button>
+            );
           })}
-        >
-          {theme === "dark" ? "切换浅色主题" : "切换深色主题"}
-        </button>
-        <div className="mt-3 px-2 text-[10px] leading-relaxed text-zinc-600">
-          {api.isTauri() ? "已连接桌面后端" : "浏览器预览模式（mock）"}
+        </nav>
+        <div className="mt-auto space-y-2 px-0.5">
+          <button type="button" className="btn-ghost w-full justify-start gap-2 text-xs" onClick={toggleTheme}>
+            {theme === "dark" ? <IconSun className="h-3.5 w-3.5" /> : <IconMoon className="h-3.5 w-3.5" />}
+            {theme === "dark" ? "浅色外观" : "深色外观"}
+          </button>
+          <div className="px-1 text-[10px] leading-relaxed" style={{ color: "var(--faint)" }}>
+            {api.isTauri() ? "已连接桌面后端" : "浏览器预览模式"}
+          </div>
         </div>
       </aside>
 
-      {/* 内容区 */}
-      <main className="min-w-0 flex-1 overflow-y-auto px-6 py-5">
-        {tab === "display" && <DisplayTab />}
-        {tab === "rules" && <RulesTab key={`r${configRev}`} />}
-        {tab === "breaks" && <BreaksTab key={`b${configRev}`} />}
-        {tab === "insights" && <InsightsTab />}
-        {tab === "rhythm" && <RhythmTab key={`rh${configRev}`} />}
-        {tab === "shortcuts" && <ShortcutsTab />}
-        {tab === "general" && <GeneralTab onImported={() => setConfigRev((v) => v + 1)} />}
-        {tab === "about" && <AboutTab version={version} />}
-      </main>
+      <div className="flex min-w-0 flex-1 flex-col">
+        <header
+          className="flex items-center justify-between border-b px-6 py-3"
+          style={{ borderColor: "var(--line)" }}
+        >
+          <div>
+            <div className="text-sm font-semibold">{current?.label}</div>
+            <div className="text-[11px]" style={{ color: "var(--muted)" }}>
+              荷鲁斯之眼 · 本地节律与滤镜
+            </div>
+          </div>
+          <StatusPills />
+        </header>
+        <main className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
+          {tab === "display" && <DisplayTab />}
+          {tab === "rules" && <RulesTab key={`r${configRev}`} />}
+          {tab === "breaks" && <BreaksTab key={`b${configRev}`} />}
+          {tab === "insights" && <InsightsTab />}
+          {tab === "rhythm" && <RhythmTab key={`rh${configRev}`} />}
+          {tab === "shortcuts" && <ShortcutsTab />}
+          {tab === "general" && <GeneralTab onImported={() => setConfigRev((v) => v + 1)} />}
+          {tab === "about" && <AboutTab version={version} />}
+        </main>
+      </div>
+    </div>
+  );
+}
+
+function StatusPills() {
+  const status = useStatus();
+  const filterOn = status?.filter_enabled !== false;
+  const safeOn = status?.safe_mode?.state === "user_on" || status?.safe_mode?.state === "rule_on";
+  const pill = (label: string, on: boolean) => (
+    <span
+      className="rounded-full border px-2.5 py-0.5 text-[11px]"
+      style={{
+        borderColor: on ? "color-mix(in srgb, var(--accent) 45%, var(--line))" : "var(--line)",
+        color: on ? "var(--accent)" : "var(--muted)",
+        background: on ? "color-mix(in srgb, var(--accent) 12%, transparent)" : "transparent",
+      }}
+    >
+      {label}
+    </span>
+  );
+  return (
+    <div className="flex items-center gap-1.5">
+      {pill(filterOn ? "滤镜开" : "滤镜关", filterOn)}
+      {pill(safeOn ? "旁路中" : "旁路关", safeOn)}
     </div>
   );
 }
@@ -367,32 +329,6 @@ function useStatus() {
     };
   }, []);
   return status;
-}
-
-function useToast() {
-  const [toasts, setToasts] = useState<{ id: number; kind: "ok" | "err"; text: string }[]>([]);
-  const push = useCallback((text: string, kind: "ok" | "err" = "ok") => {
-    const id = Date.now() + Math.random();
-    setToasts((t) => [...t, { id, kind, text }]);
-    window.setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4000);
-  }, []);
-  const node = (
-    <div className="pointer-events-none fixed bottom-4 right-4 z-50 flex flex-col gap-2">
-      {toasts.map((t) => (
-        <div
-          key={t.id}
-          className={`pointer-events-auto rounded-lg border px-3.5 py-2 text-xs shadow-lg ${
-            t.kind === "ok"
-              ? "border-brand-500/40 bg-zinc-900 text-brand-300"
-              : "border-red-800 bg-zinc-900 text-red-300"
-          }`}
-        >
-          {t.text}
-        </div>
-      ))}
-    </div>
-  );
-  return { push, node };
 }
 
 // ---------------------------------------------------------------------------
@@ -523,10 +459,10 @@ function DisplayTab() {
   return (
     <div className="space-y-4">
       {/* 滤镜旁路：一等公民 */}
-      <section className="rounded-xl border-2 border-brand-500/50 bg-brand-500/10 p-4">
+      <section className="rounded-xl border border-brand-500/40 bg-brand-500/10 p-4 shadow-inset">
         <div className="flex items-center justify-between gap-4">
           <div>
-            <h3 className="text-sm font-semibold text-brand-300">滤镜旁路（取色友好）</h3>
+            <h3 className="text-sm font-semibold text-brand-300">滤镜旁路 · 取色友好</h3>
             <p className="mt-1 text-xs leading-relaxed text-zinc-400">
               恢复系统 gamma，截图取色不发黄。设计取色、录屏、演示时开启。
             </p>
@@ -1501,11 +1437,11 @@ function AboutTab({ version }: { version: string }) {
   return (
     <div className="space-y-4">
       <div className="card flex flex-col items-center py-10 text-center">
-        <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-brand-500 text-3xl font-bold text-zinc-950">
-          E
-        </div>
-        <h2 className="mt-4 text-xl font-semibold text-zinc-100">EyesCare</h2>
-        <p className="mt-1 text-xs text-zinc-500">隐私优先、场景智能的护眼助手</p>
+        <BrandMark className="h-16 w-16" />
+        <h2 className="mt-4 text-xl font-semibold tracking-wide">EyesCare</h2>
+        <p className="mt-1 text-xs" style={{ color: "var(--muted)" }}>
+          荷鲁斯之眼 · 隐私优先的护眼节律助手
+        </p>
         <div className="mt-3 rounded-full border border-surface-border bg-surface-raised px-3 py-1 text-xs text-zinc-400">
           版本 {version || "…"}
         </div>

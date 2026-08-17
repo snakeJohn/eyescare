@@ -1117,7 +1117,7 @@ fn show_settings(app: &AppHandle) {
     .min_inner_size(720.0, 480.0)
     .resizable(true)
     .visible(false)
-    .background_color(tauri::window::Color(9, 9, 11, 255))
+    .background_color(tauri::window::Color(12, 11, 9, 255))
     .skip_taskbar(false);
     #[cfg(target_os = "windows")]
     let builder = builder.additional_browser_args(

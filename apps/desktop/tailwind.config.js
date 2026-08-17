@@ -4,29 +4,31 @@ export default {
   theme: {
     extend: {
       colors: {
-        // 品牌主色：暖琥珀（色温意象）
         brand: {
-          300: "#fcd34d",
-          400: "#fbbf24",
-          500: "#f59e0b",
-          600: "#d97706",
+          300: "#f0d18a",
+          400: "#e4b04a",
+          500: "#c9922a",
+          600: "#a67418",
         },
         surface: {
-          DEFAULT: "#09090b",
-          card: "#141417",
-          raised: "#1c1c21",
-          border: "#27272a",
+          DEFAULT: "#0c0b09",
+          card: "#161410",
+          raised: "#1e1b16",
+          border: "#2f2a22",
         },
       },
       fontFamily: {
         sans: [
+          "Segoe UI Variable",
           "system-ui",
-          "-apple-system",
           "PingFang SC",
           "Microsoft YaHei",
           "Segoe UI",
           "sans-serif",
         ],
+      },
+      boxShadow: {
+        inset: "inset 0 1px 0 0 rgb(255 255 255 / 0.04)",
       },
     },
   },

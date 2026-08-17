@@ -2,6 +2,31 @@
 @tailwind components;
 @tailwind utilities;
 
+:root,
+.theme-dark {
+  --bg: #0c0b09;
+  --card: #161410;
+  --raised: #1e1b16;
+  --line: #2f2a22;
+  --fg: #f3ead8;
+  --muted: #9a8f7a;
+  --faint: #6b6254;
+  --track: #3a342c;
+  --accent: #c9922a;
+}
+
+.theme-light {
+  --bg: #f6f1e6;
+  --card: #fffaf0;
+  --raised: #ffffff;
+  --line: #e4d8c2;
+  --fg: #1c1812;
+  --muted: #6b6254;
+  --faint: #948872;
+  --track: #d8cdb8;
+  --accent: #a67418;
+}
+
 @layer base {
   html,
   body,
@@ -9,75 +34,72 @@
     height: 100%;
   }
   body {
-    @apply bg-surface text-zinc-200 antialiased select-none;
+    background: var(--bg);
+    color: var(--fg);
+    @apply antialiased select-none;
     overflow: hidden;
   }
-  /* 输入框允许选中 */
   input,
   textarea {
     @apply select-text;
   }
 }
 
-/* 浅色主题：用可读的色彩覆盖固定的深色 Tailwind 表面，内容仍共用同一套组件。 */
-.theme-light {
-  color: #18181b;
-  background: #f8fafc;
-}
-.theme-light .bg-surface, .theme-light .bg-surface-card, .theme-light .bg-surface-card\/60 { background-color: #f8fafc !important; }
-.theme-light .bg-surface-raised, .theme-light .bg-zinc-900, .theme-light .bg-zinc-950 { background-color: #ffffff !important; }
-.theme-light .border-surface-border, .theme-light .border-zinc-800, .theme-light .border-zinc-700 { border-color: #d4d4d8 !important; }
-.theme-light .text-zinc-100, .theme-light .text-zinc-200, .theme-light .text-zinc-300, .theme-light .text-zinc-400 { color: #27272a !important; }
-.theme-light .text-zinc-500, .theme-light .text-zinc-600 { color: #52525b !important; }
-
 @layer components {
   .card {
-    @apply rounded-xl border border-surface-border bg-surface-card p-4;
+    @apply rounded-xl border p-4 shadow-inset;
+    background: var(--card);
+    border-color: var(--line);
   }
   .btn {
     @apply inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium
       transition-colors disabled:cursor-not-allowed disabled:opacity-40;
   }
   .btn-primary {
-    @apply btn bg-brand-500 text-zinc-950 hover:bg-brand-400;
+    @apply btn text-zinc-950 hover:bg-brand-400;
+    background: var(--accent);
   }
   .btn-ghost {
-    @apply btn border border-surface-border bg-surface-raised text-zinc-300 hover:border-zinc-600 hover:text-zinc-100;
+    @apply btn;
+    color: var(--fg);
+    background: var(--raised);
+    border: 1px solid var(--line);
+  }
+  .btn-ghost:hover {
+    border-color: var(--accent);
   }
   .btn-danger {
     @apply btn border border-red-900/60 bg-red-950/30 text-red-300 hover:bg-red-900/40;
   }
   .input {
-    @apply rounded-lg border border-surface-border bg-surface-raised px-2.5 py-1.5 text-sm text-zinc-200
-      outline-none focus:border-brand-500/70;
+    @apply rounded-lg px-2.5 py-1.5 text-sm outline-none;
+    color: var(--fg);
+    background: var(--raised);
+    border: 1px solid var(--line);
+  }
+  .input:focus {
+    border-color: color-mix(in srgb, var(--accent) 70%, transparent);
   }
   .label {
-    @apply text-xs font-medium text-zinc-500;
-  }
-  .tab-btn {
-    @apply flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13px] transition-colors;
-  }
-  .tab-btn-active {
-    @apply bg-brand-500/15 text-brand-300;
-  }
-  .tab-btn-idle {
-    @apply text-zinc-400 hover:bg-surface-raised hover:text-zinc-200;
+    @apply text-xs font-medium;
+    color: var(--muted);
   }
 }
 
-/* ---------- 滑杆（色温/亮度） ---------- */
 input[type="range"] {
-  @apply h-1.5 w-full cursor-pointer appearance-none rounded-full bg-zinc-700;
+  @apply h-1.5 w-full cursor-pointer appearance-none rounded-full;
+  background: var(--track);
 }
 input[type="range"]::-webkit-slider-thumb {
   -webkit-appearance: none;
-  @apply h-4 w-4 rounded-full border-2 border-zinc-950 bg-brand-400 shadow;
+  @apply h-4 w-4 rounded-full border-2 bg-brand-400 shadow;
+  border-color: var(--bg);
 }
 input[type="range"]::-moz-range-thumb {
-  @apply h-4 w-4 rounded-full border-2 border-zinc-950 bg-brand-400;
+  @apply h-4 w-4 rounded-full border-2 bg-brand-400;
+  border-color: var(--bg);
 }
 
-/* ---------- 滚动条 ---------- */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
@@ -86,13 +108,10 @@ input[type="range"]::-moz-range-thumb {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  @apply rounded-full bg-zinc-700;
-}
-::-webkit-scrollbar-thumb:hover {
-  @apply bg-zinc-600;
+  border-radius: 999px;
+  background: var(--track);
 }
 
-/* 数字输入去掉上下箭头（更紧凑） */
 input[type="number"]::-webkit-outer-spin-button,
 input[type="number"]::-webkit-inner-spin-button {
   -webkit-appearance: none;
@@ -101,4 +120,30 @@ input[type="number"]::-webkit-inner-spin-button {
 input[type="number"] {
   -moz-appearance: textfield;
   appearance: textfield;
+}
+
+/* 浅色下覆盖尚未改完的 zinc 工具类 */
+.theme-light .text-zinc-100,
+.theme-light .text-zinc-200,
+.theme-light .text-zinc-300 {
+  color: var(--fg) !important;
+}
+.theme-light .text-zinc-400,
+.theme-light .text-zinc-500 {
+  color: var(--muted) !important;
+}
+.theme-light .text-zinc-600 {
+  color: var(--faint) !important;
+}
+.theme-light .bg-zinc-950\/50,
+.theme-light .bg-zinc-900\/60,
+.theme-light .bg-zinc-800 {
+  background-color: var(--raised) !important;
+}
+.theme-light .border-zinc-800,
+.theme-light .border-zinc-700 {
+  border-color: var(--line) !important;
+}
+.theme-light .divide-surface-border > :not([hidden]) ~ :not([hidden]) {
+  border-color: var(--line);
 }
