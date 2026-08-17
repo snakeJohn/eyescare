@@ -57,3 +57,21 @@ cargo check -p eyescare-desktop
 rustup target add x86_64-pc-windows-msvc
 cargo check -p eyescare-platform-win --target x86_64-pc-windows-msvc
 ```
+
+## 发布
+
+在 GitHub 打开 **Actions → Release → Run workflow**，即可直接生成新的 GitHub Release：
+
+- **version** 留空、**bump** 选 `patch`（默认）：按当前版本发下一个补丁版（例如 `0.1.0` → `v0.1.1`）
+- **version** 填 `0.2.0` 或 `v0.2.0`：发布指定版本
+- 勾选 **prerelease** / **draft** 可发预发布或草稿
+- 版本号有变化时，工作流会自动改 `Cargo.toml` / `package.json` / `tauri.conf.json`、提交并打 tag
+
+也可以本地打 tag 后推送（tag 必须与仓库当前版本一致）：
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+产物为 Windows NSIS 安装包、免安装 ZIP 和 `SHA256SUMS.txt`。
