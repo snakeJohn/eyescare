@@ -410,6 +410,13 @@ fn set_shortcuts(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum HotkeyAction {
+    ToggleFilter,
+    ToggleSafeMode,
+    StartBreak,
+}
+
 /// 全局快捷键在 Rust 进程中注册，设置窗口关闭后仍持续有效。
 fn register_shortcuts(
     app: &AppHandle,
@@ -417,37 +424,46 @@ fn register_shortcuts(
 ) -> Result<(), String> {
     let manager = app.global_shortcut();
     manager.unregister_all().map_err(|e| e.to_string())?;
-    for shortcut in [
-        shortcuts.toggle_filter.as_str(),
-        shortcuts.toggle_safe_mode.as_str(),
-        shortcuts.start_break.as_str(),
-    ] {
+    // 不要用 shortcut.to_string() 和用户配置比：内部是 control+alt+KeyF，配置是 Ctrl+Alt+F。
+    let bindings = [
+        (shortcuts.toggle_filter.as_str(), HotkeyAction::ToggleFilter),
+        (shortcuts.toggle_safe_mode.as_str(), HotkeyAction::ToggleSafeMode),
+        (shortcuts.start_break.as_str(), HotkeyAction::StartBreak),
+    ];
+    for (combo, action) in bindings {
         manager
-            .on_shortcut(shortcut, |app, shortcut, event| {
+            .on_shortcut(combo, move |app, _shortcut, event| {
                 if event.state != ShortcutState::Pressed {
                     return;
                 }
-                let configured = app.state::<AppState>().config.lock().ok().map(|c| c.shortcuts.clone());
-                let Some(configured) = configured else { return };
-                let text = shortcut.to_string();
                 let state = app.state::<AppState>();
-                if text.eq_ignore_ascii_case(&configured.toggle_filter) {
-                    let enabled = !state.filter_enabled.load(Ordering::Relaxed);
-                    set_filter(app, &state, enabled);
-                } else if text.eq_ignore_ascii_case(&configured.toggle_safe_mode) {
-                    let mut safe = lock_mutex(&state.safe_mode);
-                    if safe.is_active() { safe.user_exit(); } else { safe.user_enter(); }
-                    drop(safe);
-                    apply_safe_claims(&state);
-                    emit_status(app, &state);
-                } else if text.eq_ignore_ascii_case(&configured.start_break) {
-                    let events = {
-                        let mut timer = lock_mutex(&state.timer);
-                        timer.start_break_now();
-                        timer.drain_events()
-                    };
-                    for event in events { handle_timer_event(app, &state, event); }
-                    emit_status(app, &state);
+                match action {
+                    HotkeyAction::ToggleFilter => {
+                        let enabled = !state.filter_enabled.load(Ordering::Relaxed);
+                        set_filter(app, &state, enabled);
+                    }
+                    HotkeyAction::ToggleSafeMode => {
+                        let mut safe = lock_mutex(&state.safe_mode);
+                        if safe.is_active() {
+                            safe.user_exit();
+                        } else {
+                            safe.user_enter();
+                        }
+                        drop(safe);
+                        apply_safe_claims(&state);
+                        emit_status(app, &state);
+                    }
+                    HotkeyAction::StartBreak => {
+                        let events = {
+                            let mut timer = lock_mutex(&state.timer);
+                            timer.start_break_now();
+                            timer.drain_events()
+                        };
+                        for event in events {
+                            handle_timer_event(app, &state, event);
+                        }
+                        emit_status(app, &state);
+                    }
                 }
             })
             .map_err(|e| e.to_string())?;

@@ -81,7 +81,7 @@ const TABS: { id: TabId; label: string; icon: (p: { className?: string }) => Rea
   { id: "insights", label: "洞察", icon: IconInsights },
   { id: "rhythm", label: "节律", icon: IconRhythm },
   { id: "shortcuts", label: "快捷键", icon: IconShortcuts },
-  { id: "general", label: "通用 / 隐私", icon: IconGeneral },
+  { id: "general", label: "通用", icon: IconGeneral },
   { id: "about", label: "关于", icon: IconAbout },
 ];
 
@@ -1319,7 +1319,6 @@ function ShortcutsTab() {
 
 function GeneralTab({ onImported }: { onImported?: () => void }) {
   const [autoStart, setAutoStartState] = useState(false);
-  const [telemetry, setTelemetry] = useState(false);
   const [busy, setBusy] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const { push, node } = useToast();
@@ -1390,18 +1389,12 @@ function GeneralTab({ onImported }: { onImported?: () => void }) {
         </div>
       </Section>
 
-      <Section title="隐私">
-        <div className="flex items-center justify-between">
-          <div>
-            <div className="text-xs text-zinc-300">遥测</div>
-            <div className="text-[11px] text-zinc-600">默认关闭；开启后仅上报匿名使用统计（版本 / 崩溃）</div>
-          </div>
-          <Switch checked={telemetry} onChange={setTelemetry} />
-        </div>
-        <div className="mt-4 border-t border-surface-border pt-3 text-[11px] leading-relaxed text-zinc-500">
-          隐私承诺：默认无网络、无遥测；前台身份默认哈希落库；明文显示名可配置且默认关；
-          摄像头、屏幕录制、日历权限全部非 MVP。
-        </div>
+      <Section title="隐私" desc="本机运行，不采集、不上报。">
+        <ul className="list-disc space-y-1.5 pl-4 text-xs leading-relaxed text-zinc-400">
+          <li>无遥测、无网络上报，配置与洞察只留在本机。</li>
+          <li>前台应用身份默认哈希后落库，明文显示名默认关闭。</li>
+          <li>不请求摄像头、屏幕录制、日历等无关权限。</li>
+        </ul>
       </Section>
 
       <Section title="配置迁移" desc="导出为 JSON 文件，可在另一台设备导入，完整迁移设置与规则。">

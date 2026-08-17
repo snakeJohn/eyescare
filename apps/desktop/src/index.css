@@ -19,12 +19,12 @@
   --bg: #f6f1e6;
   --card: #fffaf0;
   --raised: #ffffff;
-  --line: #e4d8c2;
+  --line: #d4c7ae;
   --fg: #1c1812;
-  --muted: #6b6254;
-  --faint: #948872;
+  --muted: #5c5346;
+  --faint: #7a7060;
   --track: #d8cdb8;
-  --accent: #a67418;
+  --accent: #8a5a10;
 }
 
 @layer base {
@@ -134,6 +134,33 @@ input[type="number"] {
 }
 .theme-light .text-zinc-600 {
   color: var(--faint) !important;
+}
+.theme-light .text-brand-300,
+.theme-light .text-brand-400 {
+  color: #8a5a10 !important;
+}
+.theme-light .text-sky-200,
+.theme-light .text-sky-300,
+.theme-light .text-sky-300\/90 {
+  color: #075985 !important;
+}
+.theme-light .bg-sky-950\/30 {
+  background-color: #e0f2fe !important;
+}
+.theme-light .border-sky-900\/60,
+.theme-light .bg-sky-900\/60 {
+  border-color: #7dd3fc !important;
+  background-color: #bae6fd !important;
+}
+.theme-light .text-amber-200,
+.theme-light .text-amber-300 {
+  color: #92400e !important;
+}
+.theme-light .bg-amber-950\/30 {
+  background-color: #fef3c7 !important;
+}
+.theme-light .border-amber-900\/50 {
+  border-color: #fcd34d !important;
 }
 .theme-light .bg-zinc-950\/50,
 .theme-light .bg-zinc-900\/60,

@@ -11,10 +11,10 @@ export default {
           600: "#a67418",
         },
         surface: {
-          DEFAULT: "#0c0b09",
-          card: "#161410",
-          raised: "#1e1b16",
-          border: "#2f2a22",
+          DEFAULT: "var(--bg)",
+          card: "var(--card)",
+          raised: "var(--raised)",
+          border: "var(--line)",
         },
       },
       fontFamily: {
