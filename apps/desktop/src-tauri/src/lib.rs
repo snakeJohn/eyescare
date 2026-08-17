@@ -1036,49 +1036,65 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         ],
     )?;
 
-    let _tray = tauri::tray::TrayIconBuilder::new()
+    // 只建一个托盘。tauri.conf.json 里的 app.trayIcon 会再建一个无菜单图标。
+    let icon = tauri::include_image!("icons/icon.png");
+    if let Some(existing) = app.tray_by_id("main") {
+        existing.set_menu(Some(menu))?;
+        existing.on_menu_event(on_tray_menu);
+        let _ = existing.set_tooltip(Some("EyesCare"));
+        let _ = existing.set_icon(Some(icon));
+        return Ok(());
+    }
+
+    let _tray = tauri::tray::TrayIconBuilder::with_id("main")
+        .icon(icon)
+        .tooltip("EyesCare")
         .menu(&menu)
         .show_menu_on_left_click(false)
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "toggle_filter" => {
-                let state = app.state::<AppState>();
-                let on = !state.filter_enabled.load(Ordering::Relaxed);
-                set_filter(app, &state, on);
-            }
-            "safe_mode" => {
-                let state = app.state::<AppState>();
-                {
-                    let mut sm = lock_mutex(&state.safe_mode);
-                    if sm.is_active() {
-                        sm.user_exit();
-                    } else {
-                        sm.user_enter();
-                    }
-                }
-                if state.filter_enabled.load(Ordering::Relaxed) {
-                    apply_safe_claims(&state);
-                }
-                emit_status(app, &state);
-            }
-            "preset" => {
-                let state = app.state::<AppState>();
-                if let Err(e) = apply_preset(&state, "health".into()) {
-                    tracing::warn!("tray preset failed: {e}");
-                }
-            }
-            "settings" | "today" => {
-                show_settings(app);
-            }
-            "restore" => {
-                let state = app.state::<AppState>();
-                set_filter(app, &state, false);
-            }
-            "quit" => begin_quit(app),
-            _ => {}
-        })
+        .on_menu_event(on_tray_menu)
         .build(app)?;
 
     Ok(())
+}
+
+fn on_tray_menu(app: &AppHandle, event: tauri::menu::MenuEvent) {
+    match event.id.as_ref() {
+        "toggle_filter" => {
+            let state = app.state::<AppState>();
+            let on = !state.filter_enabled.load(Ordering::Relaxed);
+            set_filter(app, &state, on);
+        }
+        "safe_mode" => {
+            let state = app.state::<AppState>();
+            {
+                let mut sm = lock_mutex(&state.safe_mode);
+                if sm.is_active() {
+                    sm.user_exit();
+                } else {
+                    sm.user_enter();
+                }
+            }
+            if state.filter_enabled.load(Ordering::Relaxed) {
+                apply_safe_claims(&state);
+            }
+            emit_status(app, &state);
+        }
+        "preset" => {
+            let state = app.state::<AppState>();
+            if let Err(e) = apply_preset(&state, "health".into()) {
+                tracing::warn!("tray preset failed: {e}");
+            }
+        }
+        "settings" | "today" => {
+            show_settings(app);
+        }
+        "restore" => {
+            let state = app.state::<AppState>();
+            set_filter(app, &state, false);
+        }
+        "quit" => begin_quit(app),
+        _ => {}
+    }
 }
 
 fn show_settings(app: &AppHandle) {
