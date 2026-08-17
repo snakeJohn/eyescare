@@ -181,6 +181,15 @@ export interface ImportOutcome {
 export const isTauri = (): boolean =>
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
+/** 运行时版本：桌面端读 Tauri 打包版本，避免界面写死。 */
+export async function getAppVersion(): Promise<string> {
+  if (!isTauri()) {
+    return "dev";
+  }
+  const { getVersion } = await import("@tauri-apps/api/app");
+  return getVersion();
+}
+
 export class BackendError extends Error {}
 
 async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {

@@ -1104,6 +1104,8 @@ fn show_settings(app: &AppHandle) {
         let _ = w.set_focus();
         return;
     }
+    // 先隐藏再建窗：WebView2 默认白底，内容未就绪时会白屏 1–2s。
+    // 前端首帧后再 show；关闭只隐藏，下次打开可复用。
     let builder = tauri::WebviewWindowBuilder::new(
         app,
         "settings",
@@ -1113,15 +1115,25 @@ fn show_settings(app: &AppHandle) {
     .inner_size(960.0, 680.0)
     .min_inner_size(720.0, 480.0)
     .resizable(true)
-    .visible(true)
+    .visible(false)
+    .background_color(tauri::window::Color(9, 9, 11, 255))
     // 设置页是由托盘打开的临时窗口，避免作为第二个任务栏入口。
     .skip_taskbar(true);
     #[cfg(target_os = "windows")]
     let builder = builder.additional_browser_args(
         "--disable-background-networking --disable-features=Translate,msSmartScreenProtection --js-flags=--max-old-space-size=64",
     );
-    if let Err(e) = builder.build() {
-        tracing::error!("failed to open settings window: {e}");
+    match builder.build() {
+        Ok(window) => {
+            let hidden = window.clone();
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = hidden.hide();
+                }
+            });
+        }
+        Err(e) => tracing::error!("failed to open settings window: {e}"),
     }
 }
 

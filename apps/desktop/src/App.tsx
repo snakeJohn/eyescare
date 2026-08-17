@@ -242,8 +242,26 @@ export default function App() {
   const [theme, setTheme] = useState<"dark" | "light">(() =>
     localStorage.getItem("eyescare-theme") === "light" ? "light" : "dark",
   );
+  const [version, setVersion] = useState("");
   // 配置导入成功后 +1：强制重挂载配置类 Tab（重新从后端加载）
   const [configRev, setConfigRev] = useState(0);
+
+  useEffect(() => {
+    api.getAppVersion().then(setVersion).catch(() => setVersion(""));
+    if (!api.isTauri()) return;
+    let cancelled = false;
+    const reveal = () => {
+      if (cancelled) return;
+      import("@tauri-apps/api/webviewWindow")
+        .then(({ getCurrentWebviewWindow }) => getCurrentWebviewWindow().show())
+        .catch(() => {});
+    };
+    const id = requestAnimationFrame(() => requestAnimationFrame(reveal));
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(id);
+    };
+  }, []);
 
   return (
     <div className={`app-theme theme-${theme} flex h-full`}>
@@ -255,7 +273,9 @@ export default function App() {
           </div>
           <div>
             <div className="text-sm font-semibold text-zinc-100">EyesCare</div>
-            <div className="text-[10px] text-zinc-500">护眼助手 · 0.1.0</div>
+            <div className="text-[10px] text-zinc-500">
+              护眼助手{version ? ` · ${version}` : ""}
+            </div>
           </div>
         </div>
         <nav className="flex flex-col gap-0.5">
@@ -296,7 +316,7 @@ export default function App() {
         {tab === "rhythm" && <RhythmTab key={`rh${configRev}`} />}
         {tab === "shortcuts" && <ShortcutsTab />}
         {tab === "general" && <GeneralTab onImported={() => setConfigRev((v) => v + 1)} />}
-        {tab === "about" && <AboutTab />}
+        {tab === "about" && <AboutTab version={version} />}
       </main>
     </div>
   );
@@ -1477,7 +1497,7 @@ function GeneralTab({ onImported }: { onImported?: () => void }) {
 // 8. 关于
 // ---------------------------------------------------------------------------
 
-function AboutTab() {
+function AboutTab({ version }: { version: string }) {
   return (
     <div className="space-y-4">
       <div className="card flex flex-col items-center py-10 text-center">
@@ -1487,7 +1507,7 @@ function AboutTab() {
         <h2 className="mt-4 text-xl font-semibold text-zinc-100">EyesCare</h2>
         <p className="mt-1 text-xs text-zinc-500">隐私优先、场景智能的护眼助手</p>
         <div className="mt-3 rounded-full border border-surface-border bg-surface-raised px-3 py-1 text-xs text-zinc-400">
-          版本 0.1.0
+          版本 {version || "…"}
         </div>
       </div>
 
