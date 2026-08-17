@@ -1099,6 +1099,7 @@ fn on_tray_menu(app: &AppHandle, event: tauri::menu::MenuEvent) {
 
 fn show_settings(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("settings") {
+        let _ = w.set_skip_taskbar(false);
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
@@ -1117,14 +1118,16 @@ fn show_settings(app: &AppHandle) {
     .resizable(true)
     .visible(false)
     .background_color(tauri::window::Color(9, 9, 11, 255))
-    // 设置页是由托盘打开的临时窗口，避免作为第二个任务栏入口。
-    .skip_taskbar(true);
+    .skip_taskbar(false);
     #[cfg(target_os = "windows")]
     let builder = builder.additional_browser_args(
         "--disable-background-networking --disable-features=Translate,msSmartScreenProtection --js-flags=--max-old-space-size=64",
     );
     match builder.build() {
         Ok(window) => {
+            if let Some(icon) = app.default_window_icon() {
+                let _ = window.set_icon(icon.clone());
+            }
             let hidden = window.clone();
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
