@@ -36,6 +36,12 @@ export interface TimerStatus {
   prebreak_remaining_sec: number | null;
 }
 
+export interface GuidedStep {
+  title: string;
+  body: string;
+  remaining_sec: number | null;
+}
+
 export interface StatusPayload {
   safe_mode: SafeModeStatus;
   timer: TimerStatus;
@@ -46,6 +52,7 @@ export interface StatusPayload {
     day_night_enabled: boolean;
   };
   filter_enabled?: boolean;
+  guided?: GuidedStep | null;
 }
 
 export interface TodaySummary {

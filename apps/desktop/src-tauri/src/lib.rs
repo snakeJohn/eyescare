@@ -24,7 +24,7 @@ use eyescare_core::rules::{RuleEngine, builtin_templates, merge_templates};
 use eyescare_core::safe_mode::{SafeModeController, SafeModeStatus};
 use eyescare_core::scene::SceneSnapshot;
 use eyescare_core::scene_engine::{self, BreaksPolicy};
-use eyescare_core::timer::{TimerEvent, TimerService};
+use eyescare_core::timer::{TimerEvent, TimerService, TimerState};
 use eyescare_platform::{DisplayBackend, ForegroundAppBackend, SystemBackend, SystemEvent};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
@@ -92,6 +92,13 @@ fn status_json(state: &State<'_, AppState>) -> serde_json::Value {
         })),
         "breaks_policy": format!("{:?}", *lock_mutex(&state.breaks_policy)),
         "filter_enabled": state.filter_enabled.load(Ordering::Relaxed),
+        "guided": lock_mutex(&state.guided).as_ref().and_then(|p| {
+            p.current_step().map(|s| serde_json::json!({
+                "title": s.title,
+                "body": s.body,
+                "remaining_sec": p.step_remaining_sec(),
+            }))
+        }),
     })
 }
 
@@ -503,6 +510,7 @@ fn import_config(state: State<'_, AppState>, bundle: ExportBundle) -> Result<Imp
 fn skip_break(app: AppHandle, state: State<'_, AppState>) {
     lock_mutex(&state.timer).skip();
     *lock_mutex(&state.guided) = None;
+    close_break_overlay(&app);
     emit_status(&app, &state);
 }
 
@@ -607,6 +615,11 @@ fn tick_once(app: &AppHandle) {
     };
     for ev in timer_events {
         handle_timer_event(app, &state, ev);
+    }
+
+    let timer_state = lock_mutex(&state.timer).status().state;
+    if matches!(timer_state, TimerState::Break | TimerState::PreBreak) {
+        emit_status(app, &state);
     }
 
     // 6) Insights heartbeat（60s 一次）+ 引导休息推进
@@ -838,10 +851,9 @@ fn handle_timer_event(app: &AppHandle, state: &State<'_, AppState>, ev: TimerEve
             let profile = cfg.timer.profile;
             let break_sec = cfg.timer.break_sec;
             drop(cfg);
-            if silent {
-                use tauri_plugin_notification::NotificationExt;
-                let _ = app.notification().builder().title("EyesCare").body("休息开始：远眺 20 秒").show();
-            } else {
+            use tauri_plugin_notification::NotificationExt;
+            let _ = app.notification().builder().title("EyesCare").body("休息开始：起来活动、远眺放松").show();
+            if !silent {
                 let steps = match profile {
                     eyescare_core::config::TimerProfile::TwentyTwentyTwenty => {
                         eyescare_core::guided::twenty_twenty_timeline(break_sec as u64)
@@ -853,11 +865,13 @@ fn handle_timer_event(app: &AppHandle, state: &State<'_, AppState>, ev: TimerEve
                 let mut player = GuidedBreakPlayer::new(steps);
                 player.start();
                 *state.guided.lock().unwrap() = Some(player);
+                show_break_overlay(app);
             }
             let _ = app.emit("timer-event", "break_started");
         }
         TimerEvent::BreakFinished { completed } => {
             *state.guided.lock().unwrap() = None;
+            close_break_overlay(app);
             let _ = app.emit("timer-event", serde_json::json!({"break_finished": completed}).to_string());
             // 洞察：休息完成/跳过
             if let Some(db) = state.insights.lock().unwrap().as_ref() {
@@ -1156,10 +1170,69 @@ fn show_settings(app: &AppHandle) {
     }
 }
 
+fn show_break_overlay(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("break") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_always_on_top(true);
+        let _ = w.set_focus();
+        return;
+    }
+    let builder = tauri::WebviewWindowBuilder::new(
+        app,
+        "break",
+        tauri::WebviewUrl::App("index.html#break".into()),
+    )
+    .title("EyesCare 引导休息")
+    .inner_size(440.0, 380.0)
+    .resizable(false)
+    .always_on_top(true)
+    .skip_taskbar(false)
+    .visible(false)
+    .center()
+    .background_color(tauri::window::Color(12, 11, 9, 255));
+    match builder.build() {
+        Ok(window) => {
+            if let Some(icon) = app.default_window_icon() {
+                let _ = window.set_icon(icon.clone());
+            }
+            let closer = window.clone();
+            let app_handle = app.clone();
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    if let Some(state) = app_handle.try_state::<AppState>() {
+                        lock_mutex(&state.timer).skip();
+                        *lock_mutex(&state.guided) = None;
+                        emit_status(&app_handle, &state);
+                    }
+                    let _ = closer.hide();
+                }
+            });
+        }
+        Err(e) => tracing::error!("failed to open break overlay: {e}"),
+    }
+}
+
+fn close_break_overlay(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("break") {
+        let _ = w.hide();
+    }
+}
+
 // ---------- 入口 ----------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "windows")]
+    {
+        // 免安装 exe 没有安装器 AUMID，不设这个 Windows 通知经常不出。
+        let _ = unsafe {
+            windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(windows::core::w!(
+                "com.eyescare.app"
+            ))
+        };
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_settings(app);

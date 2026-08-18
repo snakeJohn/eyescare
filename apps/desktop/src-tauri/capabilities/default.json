@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "EyesCare MVP-A 最小能力集（设计 §13）",
-  "windows": ["settings"],
+  "windows": ["settings", "break"],
   "permissions": [
     "core:default",
     "core:app:default",

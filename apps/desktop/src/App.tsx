@@ -260,6 +260,53 @@ export default function App() {
   );
 }
 
+export function BreakOverlay() {
+  const status = useStatus();
+  const { push, node } = useToast();
+  const theme = localStorage.getItem("eyescare-theme") === "light" ? "light" : "dark";
+  const remaining = status?.guided?.remaining_sec ?? status?.timer.break_remaining_sec ?? 0;
+  const title = status?.guided?.title ?? "远眺放松";
+  const body = status?.guided?.body ?? "看向 6 米以外，起身活动一下肩颈。";
+
+  useEffect(() => {
+    if (!api.isTauri()) return;
+    import("@tauri-apps/api/webviewWindow")
+      .then(({ getCurrentWebviewWindow }) => getCurrentWebviewWindow().show())
+      .catch(() => {});
+  }, []);
+
+  const skip = async () => {
+    try {
+      await api.skipBreak();
+    } catch (e) {
+      push(`操作失败：${(e as Error).message}`, "err");
+    }
+  };
+
+  return (
+    <div
+      className={`theme-${theme} flex h-full flex-col items-center justify-center px-8 text-center`}
+      style={{ background: "var(--bg)", color: "var(--fg)" }}
+    >
+      <BrandMark className="h-16 w-16" />
+      <div className="mt-5 text-[11px] tracking-[0.2em] uppercase" style={{ color: "var(--accent)" }}>
+        引导休息
+      </div>
+      <h1 className="mt-2 text-2xl font-semibold">{title}</h1>
+      <p className="mt-2 max-w-sm text-sm leading-relaxed" style={{ color: "var(--muted)" }}>
+        {body}
+      </p>
+      <div className="mt-6 font-mono text-5xl font-semibold tabular-nums" style={{ color: "var(--accent)" }}>
+        {fmtClock(remaining)}
+      </div>
+      <button type="button" className="btn-ghost mt-8" onClick={skip}>
+        结束本次休息
+      </button>
+      {node}
+    </div>
+  );
+}
+
 function StatusPills() {
   const status = useStatus();
   const filterOn = status?.filter_enabled !== false;
@@ -1048,6 +1095,20 @@ function BreaksTab() {
       <div className="flex items-center gap-3">
         <button type="button" className="btn-primary" onClick={saveTimer} disabled={saved}>
           {saved ? "配置已生效" : "保存并生效"}
+        </button>
+        <button
+          type="button"
+          className="btn-ghost"
+          onClick={async () => {
+            try {
+              await api.startGuidedBreak();
+              push("已开始引导休息");
+            } catch (e) {
+              push(`开始失败：${(e as Error).message}`, "err");
+            }
+          }}
+        >
+          立即开始引导休息
         </button>
         {timer?.state === "break" && (
           <button
