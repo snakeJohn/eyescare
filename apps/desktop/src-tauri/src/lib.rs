@@ -34,6 +34,22 @@ fn lock_mutex<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// 快捷键长按会连发 Pressed，必须节流。
+static HOTKEY_GATE: Mutex<Option<Instant>> = Mutex::new(None);
+static OVERLAY_SPAWNING: AtomicBool = AtomicBool::new(false);
+
+fn allow_hotkey() -> bool {
+    let mut last = lock_mutex(&HOTKEY_GATE);
+    let now = Instant::now();
+    if let Some(prev) = *last {
+        if now.saturating_duration_since(prev) < Duration::from_millis(450) {
+            return false;
+        }
+    }
+    *last = Some(now);
+    true
+}
+
 /// 应用共享状态。
 pub struct AppState {
     pub display: Arc<DisplayService>,
@@ -444,27 +460,35 @@ fn register_shortcuts(
                 if event.state != ShortcutState::Pressed {
                     return;
                 }
-                let state = app.state::<AppState>();
-                match action {
-                    HotkeyAction::ToggleFilter => {
-                        let enabled = !state.filter_enabled.load(Ordering::Relaxed);
-                        set_filter(app, &state, enabled);
-                    }
-                    HotkeyAction::ToggleSafeMode => {
-                        let mut safe = lock_mutex(&state.safe_mode);
-                        if safe.is_active() {
-                            safe.user_exit();
-                        } else {
-                            safe.user_enter();
-                        }
-                        drop(safe);
-                        apply_safe_claims(&state);
-                        emit_status(app, &state);
-                    }
-                    HotkeyAction::StartBreak => {
-                        start_user_guided_break(app, &state);
-                    }
+                if !allow_hotkey() {
+                    return;
                 }
+                let app = app.clone();
+                let _ = std::thread::Builder::new()
+                    .name("eyescare-hotkey".into())
+                    .spawn(move || {
+                        let state = app.state::<AppState>();
+                        match action {
+                            HotkeyAction::ToggleFilter => {
+                                let enabled = !state.filter_enabled.load(Ordering::SeqCst);
+                                set_filter(&app, &state, enabled);
+                            }
+                            HotkeyAction::ToggleSafeMode => {
+                                let mut safe = lock_mutex(&state.safe_mode);
+                                if safe.is_active() {
+                                    safe.user_exit();
+                                } else {
+                                    safe.user_enter();
+                                }
+                                drop(safe);
+                                apply_safe_claims(&state);
+                                emit_status(&app, &state);
+                            }
+                            HotkeyAction::StartBreak => {
+                                start_user_guided_break(&app, &state);
+                            }
+                        }
+                    });
             })
             .map_err(|e| e.to_string())?;
     }
@@ -579,7 +603,10 @@ fn spawn_tick(app: AppHandle) {
 /// 单次主循环（1s 粒度；场景采样内部按 750ms 节拍折算为每 3 tick）。
 fn tick_once(app: &AppHandle) {
     let state = app.state::<AppState>();
-    let filter_on = state.filter_enabled.load(Ordering::Relaxed);
+    if state.quitting.load(Ordering::SeqCst) {
+        return;
+    }
+    let filter_on = state.filter_enabled.load(Ordering::SeqCst);
 
     // 1) 显示动画 pump（无动画时跳过，少一次 ramp map 克隆）
     if filter_on && state.display.is_animating() {
@@ -852,18 +879,20 @@ fn heartbeat_step(state: &State<'_, AppState>) {
 fn notify_user(app: &AppHandle, body: &str) {
     let app = app.clone();
     let body = body.to_string();
-    schedule_on_main(&app, move |app| {
-        use tauri_plugin_notification::NotificationExt;
-        if let Err(e) = app
-            .notification()
-            .builder()
-            .title("EyesCare")
-            .body(&body)
-            .show()
-        {
-            tracing::warn!("notification failed: {e}");
-        }
-    });
+    let _ = std::thread::Builder::new()
+        .name("eyescare-notify".into())
+        .spawn(move || {
+            use tauri_plugin_notification::NotificationExt;
+            if let Err(e) = app
+                .notification()
+                .builder()
+                .title("EyesCare")
+                .body(&body)
+                .show()
+            {
+                tracing::warn!("notification failed: {e}");
+            }
+        });
 }
 
 fn handle_timer_event(
@@ -1018,8 +1047,9 @@ static SESSION_FILTER_WAS_ON: AtomicBool = AtomicBool::new(false);
 fn prepare_session_end(app: &AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
         let on = state.filter_enabled.load(Ordering::Relaxed);
-        SESSION_FILTER_WAS_ON.store(on, Ordering::Relaxed);
-        state.filter_enabled.store(false, Ordering::Relaxed);
+        SESSION_FILTER_WAS_ON.store(on, Ordering::SeqCst);
+        state.filter_enabled.store(false, Ordering::SeqCst);
+        state.display.set_applies_enabled(false);
         *lock_mutex(&state.last_daynight_kelvin) = None;
         let _ = state.display.restore_all();
     }
@@ -1039,10 +1069,14 @@ fn abort_session_end(app: &AppHandle) {
 /// 退出：先关滤镜挡住 tick 回写，再标 quitting，再还原 gamma。
 fn begin_quit(app: &AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
-        state.filter_enabled.store(false, Ordering::Relaxed);
+        state.quitting.store(true, Ordering::SeqCst);
+        state.filter_enabled.store(false, Ordering::SeqCst);
         *lock_mutex(&state.last_daynight_kelvin) = None;
-        state.quitting.store(true, Ordering::Relaxed);
-        let _ = state.display.restore_all();
+        state.display.set_applies_enabled(false);
+        if let Err(e) = state.display.restore_all() {
+            tracing::error!("restore_all on quit failed: {e}");
+            let _ = state.display.restore_all();
+        }
     }
     app.exit(0);
 }
@@ -1238,26 +1272,29 @@ fn show_settings(app: &AppHandle) {
     }
 }
 
-fn schedule_on_main(app: &AppHandle, f: impl FnOnce(&AppHandle) + Send + 'static) {
-    let app = app.clone();
-    if let Err(e) = app.clone().run_on_main_thread(move || f(&app)) {
-        tracing::warn!("run_on_main_thread failed: {e}");
-    }
-}
-
 fn show_break_overlay(app: &AppHandle) {
-    // 必须等设置页的 invoke 返回后再建窗，否则 WebView2 会卡住主消息循环：
-    // 大黑框、托盘右键无响应，只能任务管理器杀进程。
+    if let Some(w) = app.get_webview_window("break") {
+        let _ = w.unminimize();
+        let _ = w.set_always_on_top(true);
+        let _ = w.show();
+        let _ = w.set_focus();
+        return;
+    }
+    if OVERLAY_SPAWNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // wry 要求 create_window 在非 UI 线程调用；在主线程 build 会卡死消息循环。
     let app = app.clone();
     let _ = std::thread::Builder::new()
         .name("eyescare-break-overlay".into())
         .spawn(move || {
-            std::thread::sleep(Duration::from_millis(80));
-            schedule_on_main(&app, show_break_overlay_on_main);
+            std::thread::sleep(Duration::from_millis(50));
+            show_break_overlay_inner(&app);
+            OVERLAY_SPAWNING.store(false, Ordering::SeqCst);
         });
 }
 
-fn show_break_overlay_on_main(app: &AppHandle) {
+fn show_break_overlay_inner(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("break") {
         let _ = w.unminimize();
         let _ = w.set_always_on_top(true);
@@ -1304,11 +1341,9 @@ fn show_break_overlay_on_main(app: &AppHandle) {
 }
 
 fn close_break_overlay(app: &AppHandle) {
-    schedule_on_main(app, |app| {
-        if let Some(w) = app.get_webview_window("break") {
-            let _ = w.hide();
-        }
-    });
+    if let Some(w) = app.get_webview_window("break") {
+        let _ = w.hide();
+    }
 }
 
 /// 开始菜单快捷方式带上 AUMID，免安装 toast 才出得来。
@@ -1547,7 +1582,7 @@ pub fn run() {
                 tauri::RunEvent::ExitRequested { api, .. } => {
                     let quitting = app_handle
                         .try_state::<AppState>()
-                        .map(|s| s.quitting.load(Ordering::Relaxed))
+                        .map(|s| s.quitting.load(Ordering::SeqCst))
                         .unwrap_or(false);
                     if !quitting {
                         // 关掉设置窗不应退出托盘进程
@@ -1557,7 +1592,9 @@ pub fn run() {
                 tauri::RunEvent::Exit => {
                     // 进程真正拆除：无论路径都必须还原 gamma
                     if let Some(state) = app_handle.try_state::<AppState>() {
-                        state.filter_enabled.store(false, Ordering::Relaxed);
+                        state.quitting.store(true, Ordering::SeqCst);
+                        state.filter_enabled.store(false, Ordering::SeqCst);
+                        state.display.set_applies_enabled(false);
                         let _ = state.display.restore_all();
                     }
                 }

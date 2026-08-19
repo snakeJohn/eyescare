@@ -78,6 +78,8 @@ pub struct WindowsDisplayBackend {
     hdr_cache: Mutex<(std::time::Instant, HashMap<String, bool>)>,
     /// 默认 true（KD18 Skip）；用户 Force 时关闭。
     hdr_skip: AtomicBool,
+    /// GDI gamma 不可并发；快捷键线程和 tick 同时 SetDeviceGammaRamp 会把进程卡住。
+    apply_lock: Mutex<()>,
 }
 
 impl WindowsDisplayBackend {
@@ -89,6 +91,7 @@ impl WindowsDisplayBackend {
                 HashMap::new(),
             )),
             hdr_skip: AtomicBool::new(true),
+            apply_lock: Mutex::new(()),
         };
         backend.rebind_outputs()?;
         Ok(backend)
@@ -356,6 +359,7 @@ impl DisplayBackend for WindowsDisplayBackend {
     }
 
     fn apply_ramp(&self, id: &DisplayId, ramp: &Ramp) -> Result<ApplyReport> {
+        let _gate = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
         if self.hdr_skip.load(Ordering::Relaxed) && self.hdr_active_for(id) {
             return Ok(ApplyReport {
                 display_id: id.clone(),
@@ -421,6 +425,7 @@ impl DisplayBackend for WindowsDisplayBackend {
     }
 
     fn restore(&self, id: &DisplayId) -> Result<()> {
+        let _gate = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
         let (device_name, original) = {
             let states = self.states.lock().unwrap();
             let state = states
@@ -442,6 +447,7 @@ impl DisplayBackend for WindowsDisplayBackend {
     }
 
     fn restore_all(&self) -> Result<()> {
+        let _gate = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
         let snapshot: Vec<(String, Option<Ramp>)> = {
             let states = self.states.lock().unwrap();
             states

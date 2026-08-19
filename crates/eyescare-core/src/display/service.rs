@@ -75,7 +75,7 @@ impl DisplayService {
     }
 
     pub fn set_applies_enabled(&self, on: bool) {
-        self.applies_enabled.store(on, Ordering::Relaxed);
+        self.applies_enabled.store(on, Ordering::SeqCst);
     }
 
     /// 强制刷新显示器枚举缓存（启动、WM_DISPLAYCHANGE、rebind 后调用）。
@@ -113,6 +113,9 @@ impl DisplayService {
 
     /// 全量重算并应用。返回 apply 摘要（含 readback 失败）。
     pub fn recompute(&self) -> Result<ApplySummary, DisplayServiceError> {
+        if !self.applies_enabled.load(Ordering::SeqCst) {
+            return Ok(ApplySummary::default());
+        }
         // 枚举走缓存（首次惰性填充），避免每场景变化都查 backend + HDR
         if self.displays.lock().unwrap().is_none() {
             self.refresh_displays()?;
@@ -146,7 +149,7 @@ impl DisplayService {
 
             // P0/P1 identity：restore 启动快照，不写 identity ramp（设计 §4.6）
             if t.is_identity {
-                if !self.applies_enabled.load(Ordering::Relaxed) {
+                if !self.applies_enabled.load(Ordering::SeqCst) {
                     continue;
                 }
                 self.backend.restore(&DisplayId(t.display_id.clone()))?;
@@ -222,6 +225,9 @@ impl DisplayService {
     }
 
     pub fn pump_dt(&self, dt_ms: f64) -> Result<ApplySummary, DisplayServiceError> {
+        if !self.applies_enabled.load(Ordering::SeqCst) {
+            return Ok(ApplySummary::default());
+        }
         let mut summary = ApplySummary::default();
         let mut finished: Vec<String> = Vec::new();
 
@@ -262,7 +268,7 @@ impl DisplayService {
     }
 
     fn apply_one(&self, id: &str, ramp: &Ramp) -> Result<ApplyReport, DisplayServiceError> {
-        if !self.applies_enabled.load(Ordering::Relaxed) {
+        if !self.applies_enabled.load(Ordering::SeqCst) {
             return Ok(ApplyReport {
                 display_id: DisplayId(id.to_string()),
                 outcome: ApplyOutcome::Rejected,
@@ -290,7 +296,7 @@ impl DisplayService {
 
     /// 恢复全部屏到启动快照（托盘「恢复显示」/退出钩子）。
     pub fn restore_all(&self) -> Result<(), DisplayServiceError> {
-        self.applies_enabled.store(false, Ordering::Relaxed);
+        self.applies_enabled.store(false, Ordering::SeqCst);
         self.backend.restore_all()?;
         self.sources.lock().unwrap().clear();
         self.animating.lock().unwrap().clear();
@@ -322,6 +328,12 @@ impl DisplayService {
     }
     pub fn set_transition_ms(&mut self, ms: u64) {
         self.transition_ms = ms;
+    }
+}
+
+impl Drop for DisplayService {
+    fn drop(&mut self) {
+        let _ = self.restore_all();
     }
 }
 
