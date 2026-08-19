@@ -850,16 +850,20 @@ fn heartbeat_step(state: &State<'_, AppState>) {
 }
 
 fn notify_user(app: &AppHandle, body: &str) {
-    use tauri_plugin_notification::NotificationExt;
-    if let Err(e) = app
-        .notification()
-        .builder()
-        .title("EyesCare")
-        .body(body)
-        .show()
-    {
-        tracing::warn!("notification failed: {e}");
-    }
+    let app = app.clone();
+    let body = body.to_string();
+    schedule_on_main(&app, move |app| {
+        use tauri_plugin_notification::NotificationExt;
+        if let Err(e) = app
+            .notification()
+            .builder()
+            .title("EyesCare")
+            .body(&body)
+            .show()
+        {
+            tracing::warn!("notification failed: {e}");
+        }
+    });
 }
 
 fn handle_timer_event(
@@ -1234,63 +1238,57 @@ fn show_settings(app: &AppHandle) {
     }
 }
 
-fn place_overlay_on_active_monitor(app: &AppHandle, window: &tauri::WebviewWindow) {
-    let monitor = app
-        .cursor_position()
-        .ok()
-        .and_then(|p| app.monitor_from_point(p.x, p.y).ok().flatten())
-        .or_else(|| app.primary_monitor().ok().flatten());
-    let Some(monitor) = monitor else {
-        return;
-    };
-    let mpos = monitor.position();
-    let msize = monitor.size();
-    let wsize = window
-        .outer_size()
-        .unwrap_or(tauri::PhysicalSize::new(520, 520));
-    let x = mpos.x + (msize.width as i32 - wsize.width as i32) / 2;
-    let y = mpos.y + (msize.height as i32 - wsize.height as i32) / 2;
-    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
-}
-
-fn reveal_break_overlay(app: &AppHandle, window: &tauri::WebviewWindow) {
-    place_overlay_on_active_monitor(app, window);
-    let _ = window.set_always_on_top(true);
-    let _ = window.unminimize();
-    let _ = window.show();
-    let _ = window.set_focus();
+fn schedule_on_main(app: &AppHandle, f: impl FnOnce(&AppHandle) + Send + 'static) {
+    let app = app.clone();
+    if let Err(e) = app.clone().run_on_main_thread(move || f(&app)) {
+        tracing::warn!("run_on_main_thread failed: {e}");
+    }
 }
 
 fn show_break_overlay(app: &AppHandle) {
+    // 必须等设置页的 invoke 返回后再建窗，否则 WebView2 会卡住主消息循环：
+    // 大黑框、托盘右键无响应，只能任务管理器杀进程。
+    let app = app.clone();
+    let _ = std::thread::Builder::new()
+        .name("eyescare-break-overlay".into())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            schedule_on_main(&app, show_break_overlay_on_main);
+        });
+}
+
+fn show_break_overlay_on_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("break") {
-        reveal_break_overlay(app, &w);
+        let _ = w.unminimize();
+        let _ = w.set_always_on_top(true);
+        let _ = w.show();
+        let _ = w.set_focus();
         return;
     }
+    // 不要带 #break：asset 协议可能把 fragment 当成路径，页面空白只剩黑底。
+    // 前端用窗口 label === "break" 判断。
     let builder = tauri::WebviewWindowBuilder::new(
         app,
         "break",
-        tauri::WebviewUrl::App("index.html#break".into()),
+        tauri::WebviewUrl::App("index.html".into()),
     )
     .title("EyesCare 引导休息")
-    .inner_size(520.0, 520.0)
+    .inner_size(420.0, 460.0)
     .resizable(false)
-    .decorations(false)
+    .decorations(true)
     .always_on_top(true)
-    .skip_taskbar(true)
-    .visible(true)
-    .focused(true)
+    .skip_taskbar(false)
+    .visible(false)
     .center()
     .background_color(tauri::window::Color(12, 11, 9, 255));
-    #[cfg(target_os = "windows")]
-    let builder = builder.additional_browser_args(
-        "--disable-background-networking --disable-features=Translate,msSmartScreenProtection --js-flags=--max-old-space-size=64",
-    );
     match builder.build() {
         Ok(window) => {
             if let Some(icon) = app.default_window_icon() {
                 let _ = window.set_icon(icon.clone());
             }
-            reveal_break_overlay(app, &window);
+            let _ = window.show();
+            let _ = window.set_always_on_top(true);
+            let _ = window.set_focus();
             let app_handle = app.clone();
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -1306,9 +1304,11 @@ fn show_break_overlay(app: &AppHandle) {
 }
 
 fn close_break_overlay(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window("break") {
-        let _ = w.hide();
-    }
+    schedule_on_main(app, |app| {
+        if let Some(w) = app.get_webview_window("break") {
+            let _ = w.hide();
+        }
+    });
 }
 
 /// 开始菜单快捷方式带上 AUMID，免安装 toast 才出得来。
