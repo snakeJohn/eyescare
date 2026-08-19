@@ -268,6 +268,12 @@ impl TimerService {
     pub fn state(&self) -> TimerState {
         self.state
     }
+
+    /// 热更新参数，不重置当前工作/休息进度。
+    pub fn apply_config(&mut self, cfg: TimerConfig) {
+        self.idle_pause_sec = cfg.idle_pause_sec.max(10) as u64;
+        self.cfg = cfg;
+    }
 }
 
 #[cfg(test)]
@@ -467,5 +473,23 @@ mod tests {
         assert!(t.status().prebreak_remaining_sec.is_none());
         let evs = t.drain_events();
         assert!(evs.contains(&TimerEvent::BreakFinished { completed: false }));
+    }
+
+    #[test]
+    fn apply_config_keeps_work_elapsed() {
+        let mut t = TimerService::new(cfg(1200, 20));
+        let t0 = Instant::now();
+        for i in 0..18 {
+            t.tick(t0 + Duration::from_secs(i), BreaksPolicy::Keep);
+        }
+        let elapsed = t.status().work_elapsed_sec;
+        assert!(elapsed >= 18);
+        t.apply_config(TimerConfig {
+            work_sec: 600,
+            break_sec: 30,
+            ..cfg(600, 30)
+        });
+        assert_eq!(t.state(), TimerState::Working);
+        assert_eq!(t.status().work_elapsed_sec, elapsed);
     }
 }

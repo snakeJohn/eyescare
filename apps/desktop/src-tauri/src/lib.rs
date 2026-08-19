@@ -72,10 +72,10 @@ fn get_status(state: State<'_, AppState>) -> serde_json::Value {
 }
 
 fn status_json(state: &State<'_, AppState>) -> serde_json::Value {
-    let sm = state.safe_mode.lock().unwrap().status();
-    let timer = state.timer.lock().unwrap().status();
-    let cfg = state.config.lock().unwrap();
-    let scene = state.scene.lock().unwrap().clone();
+    let sm = lock_mutex(&state.safe_mode).status();
+    let timer = lock_mutex(&state.timer).status();
+    let cfg = lock_mutex(&state.config);
+    let scene = lock_mutex(&state.scene).clone();
     serde_json::json!({
         "safe_mode": sm,
         "timer": timer,
@@ -285,17 +285,18 @@ fn install_templates(state: State<'_, AppState>) -> Result<usize, String> {
 // ---------- 计时 / 昼夜命令 ----------
 
 #[tauri::command]
-fn set_timer_config(state: State<'_, AppState>, config: TimerConfig) -> Result<(), String> {
+fn set_timer_config(app: AppHandle, state: State<'_, AppState>, config: TimerConfig) -> Result<(), String> {
     // 校验边界（与 config.validated 一致；直接构造不经过 validated）
     if config.work_sec < 30 || config.break_sec < 5 || config.idle_pause_sec < 10 {
         return Err("invalid timer config: work_sec>=30, break_sec>=5, idle_pause_sec>=10".into());
     }
     {
-        let mut cfg = state.config.lock().unwrap();
+        let mut cfg = lock_mutex(&state.config);
         cfg.timer = config.clone();
         state.store.save_config(&cfg).map_err(|e| e.to_string())?;
     }
-    *state.timer.lock().unwrap() = TimerService::new(config);
+    lock_mutex(&state.timer).apply_config(config);
+    emit_status(&app, &state);
     Ok(())
 }
 
@@ -461,15 +462,7 @@ fn register_shortcuts(
                         emit_status(app, &state);
                     }
                     HotkeyAction::StartBreak => {
-                        let events = {
-                            let mut timer = lock_mutex(&state.timer);
-                            timer.start_break_now();
-                            timer.drain_events()
-                        };
-                        for event in events {
-                            handle_timer_event(app, &state, event);
-                        }
-                        emit_status(app, &state);
+                        start_user_guided_break(app, &state);
                     }
                 }
             })
@@ -500,31 +493,54 @@ fn export_config(state: State<'_, AppState>) -> Result<ExportBundle, String> {
 }
 
 #[tauri::command]
-fn import_config(state: State<'_, AppState>, bundle: ExportBundle) -> Result<ImportOutcome, String> {
+fn import_config(app: AppHandle, state: State<'_, AppState>, bundle: ExportBundle) -> Result<ImportOutcome, String> {
     let outcome = state.store.import(&bundle).map_err(|e| e.to_string())?;
-    reload_config_into_state(&state)?;
+    reload_config_into_state(&app, &state)?;
     Ok(outcome)
 }
 
 #[tauri::command]
 fn skip_break(app: AppHandle, state: State<'_, AppState>) {
-    lock_mutex(&state.timer).skip();
-    *lock_mutex(&state.guided) = None;
-    close_break_overlay(&app);
-    emit_status(&app, &state);
+    end_break_from_ui(&app, &state);
 }
 
 #[tauri::command]
 fn start_guided_break(app: AppHandle, state: State<'_, AppState>) {
+    start_user_guided_break(&app, &state);
+}
+
+#[derive(Clone, Copy)]
+enum OverlayPolicy {
+    /// 自动到点：尊重「引导 / 静默」开关。
+    Auto,
+    /// 按钮 / 快捷键 / 托盘：强制弹出引导窗。
+    Force,
+}
+
+fn start_user_guided_break(app: &AppHandle, state: &State<'_, AppState>) {
     let events = {
         let mut timer = lock_mutex(&state.timer);
         timer.start_break_now();
         timer.drain_events()
     };
     for event in events {
-        handle_timer_event(&app, &state, event);
+        handle_timer_event(app, state, event, OverlayPolicy::Force);
     }
-    emit_status(&app, &state);
+    emit_status(app, state);
+}
+
+fn end_break_from_ui(app: &AppHandle, state: &State<'_, AppState>) {
+    let events = {
+        let mut timer = lock_mutex(&state.timer);
+        timer.skip();
+        timer.drain_events()
+    };
+    for event in events {
+        handle_timer_event(app, state, event, OverlayPolicy::Auto);
+    }
+    *lock_mutex(&state.guided) = None;
+    close_break_overlay(app);
+    emit_status(app, state);
 }
 
 // ---------- 主循环 ----------
@@ -614,7 +630,7 @@ fn tick_once(app: &AppHandle) {
         })
     };
     for ev in timer_events {
-        handle_timer_event(app, &state, ev);
+        handle_timer_event(app, &state, ev, OverlayPolicy::Auto);
     }
 
     let timer_state = lock_mutex(&state.timer).status().state;
@@ -833,26 +849,46 @@ fn heartbeat_step(state: &State<'_, AppState>) {
     }
 }
 
-fn handle_timer_event(app: &AppHandle, state: &State<'_, AppState>, ev: TimerEvent) {
+fn notify_user(app: &AppHandle, body: &str) {
+    use tauri_plugin_notification::NotificationExt;
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title("EyesCare")
+        .body(body)
+        .show()
+    {
+        tracing::warn!("notification failed: {e}");
+    }
+}
+
+fn handle_timer_event(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    ev: TimerEvent,
+    overlay: OverlayPolicy,
+) {
     match ev {
         TimerEvent::BreakDue => {
             let _ = app.emit("timer-event", "break_due");
-            use tauri_plugin_notification::NotificationExt;
-            let _ = app.notification().builder().title("EyesCare").body("休息时间到了，起来活动一下").show();
+            // Keep 策略下紧接着会有 BreakStarted，只留一条休息通知。
+            let already_in_break = lock_mutex(&state.timer).state() == TimerState::Break;
+            if !already_in_break {
+                notify_user(app, "休息时间到了：远眺 6 米，起身活动一下");
+            }
             if let Some(db) = lock_mutex(&state.insights).as_ref() {
                 let now = chrono::Utc::now().timestamp();
                 let _ = db.record_break(now, "break_prompted");
             }
         }
         TimerEvent::BreakStarted => {
-            // 引导休息播放器
-            let cfg = state.config.lock().unwrap();
-            let silent = cfg.timer.silent_break || !cfg.timer.guided;
+            let cfg = lock_mutex(&state.config);
+            let silent = matches!(overlay, OverlayPolicy::Auto)
+                && (cfg.timer.silent_break || !cfg.timer.guided);
             let profile = cfg.timer.profile;
             let break_sec = cfg.timer.break_sec;
             drop(cfg);
-            use tauri_plugin_notification::NotificationExt;
-            let _ = app.notification().builder().title("EyesCare").body("休息开始：起来活动、远眺放松").show();
+            notify_user(app, "休息开始：远眺 6 米，起身活动一下");
             if !silent {
                 let steps = match profile {
                     eyescare_core::config::TimerProfile::TwentyTwentyTwenty => {
@@ -864,24 +900,22 @@ fn handle_timer_event(app: &AppHandle, state: &State<'_, AppState>, ev: TimerEve
                 };
                 let mut player = GuidedBreakPlayer::new(steps);
                 player.start();
-                *state.guided.lock().unwrap() = Some(player);
+                *lock_mutex(&state.guided) = Some(player);
                 show_break_overlay(app);
             }
             let _ = app.emit("timer-event", "break_started");
         }
         TimerEvent::BreakFinished { completed } => {
-            *state.guided.lock().unwrap() = None;
+            *lock_mutex(&state.guided) = None;
             close_break_overlay(app);
             let _ = app.emit("timer-event", serde_json::json!({"break_finished": completed}).to_string());
-            // 洞察：休息完成/跳过
-            if let Some(db) = state.insights.lock().unwrap().as_ref() {
+            if let Some(db) = lock_mutex(&state.insights).as_ref() {
                 let now = chrono::Utc::now().timestamp();
                 let _ = db.record_break(now, if completed { "break_completed" } else { "break_skipped" });
             }
         }
         TimerEvent::PreBreakStarted => {
-            use tauri_plugin_notification::NotificationExt;
-            let _ = app.notification().builder().title("EyesCare").body("30 秒后开始休息").show();
+            notify_user(app, "30 秒后开始休息");
             let _ = app.emit("timer-event", "prebreak");
         }
         TimerEvent::PausedChanged { paused } => {
@@ -938,12 +972,12 @@ fn refresh_engine(state: &State<'_, AppState>) {
     *state.engine.lock().unwrap() = RuleEngine::from_config(&rules);
 }
 
-fn reload_config_into_state(state: &State<'_, AppState>) -> Result<(), String> {
+fn reload_config_into_state(app: &AppHandle, state: &State<'_, AppState>) -> Result<(), String> {
     let cfg = state.store.load_config().map_err(|e| e.to_string())?;
     let rules = state.store.load_rules().map_err(|e| e.to_string())?;
     *lock_mutex(&state.config) = cfg.clone();
     *lock_mutex(&state.rules) = rules;
-    *lock_mutex(&state.timer) = TimerService::new(cfg.timer.clone());
+    lock_mutex(&state.timer).apply_config(cfg.timer.clone());
     *lock_mutex(&state.safe_mode) = SafeModeController::new(cfg.safe_mode.clone());
     refresh_engine(state);
     *lock_mutex(&state.last_claim_sig) = None;
@@ -953,6 +987,10 @@ fn reload_config_into_state(state: &State<'_, AppState>) -> Result<(), String> {
     if state.filter_enabled.load(Ordering::Relaxed) {
         reapply_display_sources(state);
     }
+    if let Err(e) = register_shortcuts(app, &cfg.shortcuts) {
+        tracing::warn!("re-register shortcuts after import failed: {e}");
+    }
+    emit_status(app, state);
     Ok(())
 }
 
@@ -1047,6 +1085,8 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 
     let toggle_filter = MenuItem::with_id(app, "toggle_filter", "滤镜开关", true, None::<&str>)?;
     let safe_mode = MenuItem::with_id(app, "safe_mode", "滤镜旁路", true, None::<&str>)?;
+    let start_break = MenuItem::with_id(app, "start_break", "开始引导休息", true, None::<&str>)?;
+    let end_break = MenuItem::with_id(app, "end_break", "结束休息", true, None::<&str>)?;
     let preset = MenuItem::with_id(app, "preset", "预设：健康", true, None::<&str>)?;
     let today = MenuItem::with_id(app, "today", "今日洞察…", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "设置…", true, None::<&str>)?;
@@ -1058,6 +1098,8 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         &[
             &toggle_filter,
             &safe_mode,
+            &start_break,
+            &end_break,
             &preset,
             &today,
             &settings,
@@ -1071,6 +1113,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     if let Some(existing) = app.tray_by_id("main") {
         existing.set_menu(Some(menu))?;
         existing.on_menu_event(on_tray_menu);
+        existing.on_tray_icon_event(on_tray_click);
         let _ = existing.set_tooltip(Some("EyesCare"));
         let _ = existing.set_icon(Some(icon));
         return Ok(());
@@ -1082,6 +1125,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(on_tray_menu)
+        .on_tray_icon_event(on_tray_click)
         .build(app)?;
 
     Ok(())
@@ -1115,6 +1159,14 @@ fn on_tray_menu(app: &AppHandle, event: tauri::menu::MenuEvent) {
                 tracing::warn!("tray preset failed: {e}");
             }
         }
+        "start_break" => {
+            let state = app.state::<AppState>();
+            start_user_guided_break(app, &state);
+        }
+        "end_break" => {
+            let state = app.state::<AppState>();
+            end_break_from_ui(app, &state);
+        }
         "settings" | "today" => {
             show_settings(app);
         }
@@ -1124,6 +1176,18 @@ fn on_tray_menu(app: &AppHandle, event: tauri::menu::MenuEvent) {
         }
         "quit" => begin_quit(app),
         _ => {}
+    }
+}
+
+fn on_tray_click(tray: &tauri::tray::TrayIcon, event: tauri::tray::TrayIconEvent) {
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
+    if let TrayIconEvent::Click {
+        button: MouseButton::Left,
+        button_state: MouseButtonState::Up,
+        ..
+    } = event
+    {
+        show_settings(tray.app_handle());
     }
 }
 
@@ -1170,12 +1234,36 @@ fn show_settings(app: &AppHandle) {
     }
 }
 
+fn place_overlay_on_active_monitor(app: &AppHandle, window: &tauri::WebviewWindow) {
+    let monitor = app
+        .cursor_position()
+        .ok()
+        .and_then(|p| app.monitor_from_point(p.x, p.y).ok().flatten())
+        .or_else(|| app.primary_monitor().ok().flatten());
+    let Some(monitor) = monitor else {
+        return;
+    };
+    let mpos = monitor.position();
+    let msize = monitor.size();
+    let wsize = window
+        .outer_size()
+        .unwrap_or(tauri::PhysicalSize::new(520, 520));
+    let x = mpos.x + (msize.width as i32 - wsize.width as i32) / 2;
+    let y = mpos.y + (msize.height as i32 - wsize.height as i32) / 2;
+    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+}
+
+fn reveal_break_overlay(app: &AppHandle, window: &tauri::WebviewWindow) {
+    place_overlay_on_active_monitor(app, window);
+    let _ = window.set_always_on_top(true);
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
 fn show_break_overlay(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("break") {
-        let _ = w.show();
-        let _ = w.unminimize();
-        let _ = w.set_always_on_top(true);
-        let _ = w.set_focus();
+        reveal_break_overlay(app, &w);
         return;
     }
     let builder = tauri::WebviewWindowBuilder::new(
@@ -1184,29 +1272,32 @@ fn show_break_overlay(app: &AppHandle) {
         tauri::WebviewUrl::App("index.html#break".into()),
     )
     .title("EyesCare 引导休息")
-    .inner_size(440.0, 380.0)
+    .inner_size(520.0, 520.0)
     .resizable(false)
+    .decorations(false)
     .always_on_top(true)
-    .skip_taskbar(false)
-    .visible(false)
+    .skip_taskbar(true)
+    .visible(true)
+    .focused(true)
     .center()
     .background_color(tauri::window::Color(12, 11, 9, 255));
+    #[cfg(target_os = "windows")]
+    let builder = builder.additional_browser_args(
+        "--disable-background-networking --disable-features=Translate,msSmartScreenProtection --js-flags=--max-old-space-size=64",
+    );
     match builder.build() {
         Ok(window) => {
             if let Some(icon) = app.default_window_icon() {
                 let _ = window.set_icon(icon.clone());
             }
-            let closer = window.clone();
+            reveal_break_overlay(app, &window);
             let app_handle = app.clone();
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     if let Some(state) = app_handle.try_state::<AppState>() {
-                        lock_mutex(&state.timer).skip();
-                        *lock_mutex(&state.guided) = None;
-                        emit_status(&app_handle, &state);
+                        end_break_from_ui(&app_handle, &state);
                     }
-                    let _ = closer.hide();
                 }
             });
         }
@@ -1217,6 +1308,63 @@ fn show_break_overlay(app: &AppHandle) {
 fn close_break_overlay(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("break") {
         let _ = w.hide();
+    }
+}
+
+/// 开始菜单快捷方式带上 AUMID，免安装 toast 才出得来。
+#[cfg(target_os = "windows")]
+fn ensure_toast_shortcut() {
+    use windows::core::{Interface, HSTRING};
+    use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+        IPersistFile,
+    };
+    use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("current_exe for toast shortcut failed: {e}");
+            return;
+        }
+    };
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        tracing::warn!("APPDATA missing; cannot create toast shortcut");
+        return;
+    };
+    let dir = std::path::PathBuf::from(appdata)
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("create Start Menu Programs failed: {e}");
+        return;
+    }
+    let link_path = dir.join("EyesCare.lnk");
+
+    let result = (|| -> windows::core::Result<()> {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let sl: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+            sl.SetPath(&HSTRING::from(exe.to_string_lossy().as_ref()))?;
+            if let Some(parent) = exe.parent() {
+                let _ = sl.SetWorkingDirectory(&HSTRING::from(parent.to_string_lossy().as_ref()));
+            }
+            let _ = sl.SetDescription(&HSTRING::from("EyesCare"));
+            let store: IPropertyStore = sl.cast()?;
+            let pv = windows::core::PROPVARIANT::from("com.eyescare.app");
+            store.SetValue(&PKEY_AppUserModel_ID, &pv)?;
+            store.Commit()?;
+            let persist: IPersistFile = sl.cast()?;
+            persist.Save(&HSTRING::from(link_path.to_string_lossy().as_ref()), true)?;
+            Ok(())
+        }
+    })();
+    if let Err(e) = result {
+        tracing::warn!("toast AUMID shortcut failed: {e}");
     }
 }
 
@@ -1232,6 +1380,7 @@ pub fn run() {
                 "com.eyescare.app"
             ))
         };
+        ensure_toast_shortcut();
     }
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {

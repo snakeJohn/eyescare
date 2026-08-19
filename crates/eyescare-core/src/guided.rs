@@ -17,33 +17,34 @@ pub struct BreakStep {
     pub chime: bool,
 }
 
-/// 20-20-20 时间轴（§6.2 MVP UX 表）。
-pub fn twenty_twenty_timeline(break_sec: u64) -> Vec<BreakStep> {
-    vec![BreakStep {
-        title: "远眺窗外",
-        body: "看向 6 米以外，放松眼部调节肌肉。",
-        duration_sec: break_sec.max(20),
-        chime: true,
-    }]
-}
-
-/// 普通休息时间轴（引导性更强）。
-pub fn normal_timeline(break_sec: u64) -> Vec<BreakStep> {
-    let s = break_sec.max(30);
+fn look_then_stand(break_sec: u64, min_total: u64) -> Vec<BreakStep> {
+    let s = break_sec.max(min_total).max(2);
+    let look = (s / 2).max(1);
+    let stand = s.saturating_sub(look).max(1);
     vec![
         BreakStep {
-            title: "闭眼放松",
-            body: "轻闭双眼 10 秒，让泪膜均匀覆盖。",
-            duration_sec: 10,
+            title: "远眺窗外",
+            body: "看向 6 米以外，放松眼部调节肌肉。",
+            duration_sec: look,
             chime: true,
         },
         BreakStep {
-            title: "远眺",
-            body: "看向远处，活动颈椎，深呼吸三次。",
-            duration_sec: s.saturating_sub(10).max(10),
-            chime: false,
+            title: "起立活动",
+            body: "站起来走动几步，活动肩颈和腿，避免久坐。",
+            duration_sec: stand,
+            chime: true,
         },
     ]
+}
+
+/// 20-20-20 时间轴：远眺 + 起立。
+pub fn twenty_twenty_timeline(break_sec: u64) -> Vec<BreakStep> {
+    look_then_stand(break_sec, 20)
+}
+
+/// 普通休息时间轴：远眺 + 起立（稍长）。
+pub fn normal_timeline(break_sec: u64) -> Vec<BreakStep> {
+    look_then_stand(break_sec, 30)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,16 +171,16 @@ mod tests {
         assert_eq!(p.state(), GuidedState::Idle);
         p.start();
         assert_eq!(p.state(), GuidedState::Playing);
-        assert_eq!(p.current_step().unwrap().title, "闭眼放松");
-        // 10s 后进入第二步
+        assert_eq!(p.current_step().unwrap().title, "远眺窗外");
+        let first = p.current_step().unwrap().duration_sec;
         let mut changed = false;
-        for _ in 0..10 {
+        for _ in 0..first {
             changed = p.tick();
         }
         assert!(changed);
-        assert_eq!(p.current_step().unwrap().title, "远眺");
-        // 走完剩余
-        for _ in 0..20 {
+        assert_eq!(p.current_step().unwrap().title, "起立活动");
+        let second = p.current_step().unwrap().duration_sec;
+        for _ in 0..second {
             p.tick();
         }
         assert_eq!(p.state(), GuidedState::Done);
@@ -212,5 +213,14 @@ mod tests {
         let mut p = GuidedBreakPlayer::new(vec![]);
         p.start();
         assert_eq!(p.state(), GuidedState::Done);
+    }
+
+    #[test]
+    fn twenty_twenty_has_look_and_stand() {
+        let steps = twenty_twenty_timeline(20);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].title, "远眺窗外");
+        assert_eq!(steps[1].title, "起立活动");
+        assert_eq!(steps.iter().map(|s| s.duration_sec).sum::<u64>(), 20);
     }
 }

@@ -264,29 +264,37 @@ export function BreakOverlay() {
   const status = useStatus();
   const { push, node } = useToast();
   const theme = localStorage.getItem("eyescare-theme") === "light" ? "light" : "dark";
-  const remaining = status?.guided?.remaining_sec ?? status?.timer.break_remaining_sec ?? 0;
-  const title = status?.guided?.title ?? "远眺放松";
+  const remaining = status?.timer.break_remaining_sec ?? 0;
+  const title = status?.guided?.title ?? "远眺窗外";
   const body = status?.guided?.body ?? "看向 6 米以外，起身活动一下肩颈。";
 
-  useEffect(() => {
-    if (!api.isTauri()) return;
-    import("@tauri-apps/api/webviewWindow")
-      .then(({ getCurrentWebviewWindow }) => getCurrentWebviewWindow().show())
-      .catch(() => {});
-  }, []);
-
-  const skip = async () => {
+  const skip = useCallback(async () => {
     try {
       await api.skipBreak();
     } catch (e) {
       push(`操作失败：${(e as Error).message}`, "err");
     }
-  };
+  }, [push]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        void skip();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [skip]);
 
   return (
     <div
       className={`theme-${theme} flex h-full flex-col items-center justify-center px-8 text-center`}
-      style={{ background: "var(--bg)", color: "var(--fg)" }}
+      style={{
+        background: "var(--bg)",
+        color: "var(--fg)",
+        border: "1px solid color-mix(in srgb, var(--accent) 35%, var(--line))",
+      }}
     >
       <BrandMark className="h-16 w-16" />
       <div className="mt-5 text-[11px] tracking-[0.2em] uppercase" style={{ color: "var(--accent)" }}>
@@ -354,6 +362,11 @@ function ensurePolling() {
   };
   tick();
   sharedTimer = window.setInterval(tick, 2000);
+  if (typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) void tick();
+    });
+  }
   // 后端状态变化事件（旁路切换等）：即时刷新，不等下一轮询
   if (api.isTauri()) {
     import("@tauri-apps/api/event").then(({ listen }) => {
@@ -976,7 +989,7 @@ function BreaksTab() {
         <div className="grid grid-cols-2 gap-2">
           {(
             [
-              ["twenty_twenty_twenty", "20-20-20", "每 20 分钟远眺 20 秒"],
+              ["twenty_twenty_twenty", "20-20-20", "每 20 分钟远眺并起立 20 秒"],
               ["normal", "普通", "工作 N 分钟休息 M 分钟"],
             ] as const
           ).map(([v, name, desc]) => (
@@ -1016,15 +1029,16 @@ function BreaksTab() {
           </Field>
           <Field
             label={profile === "twenty_twenty_twenty" ? "休息时长（秒）" : "休息时长（分钟）"}
-            hint={profile === "twenty_twenty_twenty" ? "建议 20 秒远眺 6 米外" : undefined}
+            hint={profile === "twenty_twenty_twenty" ? "建议 20 秒：远眺 6 米 + 起立活动" : undefined}
           >
             <input
               type="number"
-              min={1}
+              min={profile === "twenty_twenty_twenty" ? 5 : 1}
               className="input w-full"
               value={breakVal}
               onChange={(e) => {
-                setBreakVal(Math.max(1, Number(e.target.value)));
+                const floor = profile === "twenty_twenty_twenty" ? 5 : 1;
+                setBreakVal(Math.max(floor, Number(e.target.value)));
                 setSaved(false);
               }}
             />
@@ -1066,7 +1080,7 @@ function BreaksTab() {
           <div className="flex items-center justify-between">
             <div>
               <div className="text-xs text-zinc-300">引导休息</div>
-              <div className="text-[11px] text-zinc-600">休息时全屏引导动画（呼吸 / 远眺）</div>
+              <div className="text-[11px] text-zinc-600">到点弹出远眺与起立引导。关闭后仅通知；快捷键和按钮仍可弹出</div>
             </div>
             <Switch
               checked={guided}
@@ -1079,7 +1093,7 @@ function BreaksTab() {
           <div className="flex items-center justify-between">
             <div>
               <div className="text-xs text-zinc-300">静默休息</div>
-              <div className="text-[11px] text-zinc-600">不弹引导 Overlay，仅桌面通知</div>
+              <div className="text-[11px] text-zinc-600">自动到点不弹窗，仅通知。手动开始仍会弹出引导</div>
             </div>
             <Switch
               checked={silent}
@@ -1130,8 +1144,8 @@ function BreaksTab() {
       </div>
 
       <Note>
-        计时参数与引导选项写入本地 config.json 并立即生效；空闲暂停依赖系统输入检测
-        （无操作超过阈值即暂停计时）。
+        计时参数与引导选项写入本地 config.json 并立即生效，不会清空当前专注进度。
+        空闲暂停依赖系统输入检测（无操作超过阈值即暂停计时）。
       </Note>
       {node}
     </div>
