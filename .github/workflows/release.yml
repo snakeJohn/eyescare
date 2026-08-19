@@ -1,17 +1,21 @@
 # 发布 Windows 安装包到 GitHub Releases。
 #
-# 用法 1（推荐）：Actions → Release → Run workflow
-#   - version 留空 + bump=patch：按当前版本发下一个补丁版（0.1.0 → v0.1.1）
-#   - version=0.2.0：发布指定版本
-#   - 版本号有变化时会自动改仓库版本、提交并打 tag
+# 用法 1（默认）：推送到 main / master
+#   自动 patch +1、提交 chore(release)、打 tag、上传 NSIS + portable
+#   提交说明含 [skip release] 或本身是 chore(release) 则跳过
 #
-# 用法 2：本地打 tag 后推送
+# 用法 2：Actions → Release → Run workflow
+#   - version 留空 + bump=patch：按当前版本发下一个补丁版（0.5.0 → v0.5.1）
+#   - version=0.2.0：发布指定版本
+#
+# 用法 3：本地打 tag 后推送
 #   git tag v0.2.0 && git push origin v0.2.0
 #   tag 必须与 tauri.conf.json 中的 version 一致
 name: Release
 
 on:
   push:
+    branches: [main, master]
     tags:
       - "v*"
   workflow_dispatch:
@@ -67,6 +71,8 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message || '' }}
           INPUT_VERSION: ${{ inputs.version || '' }}
           INPUT_BUMP: ${{ inputs.bump || 'none' }}
           INPUT_PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
@@ -100,6 +106,9 @@ jobs:
                   raise SystemExit(f"Invalid version: {ver!r}")
               return int(m.group(1)), int(m.group(2)), int(m.group(3))
 
+          def format_core(major: int, minor: int, patch: int) -> str:
+              return f"{major}.{minor}.{patch}"
+
           def replace_once(path: pathlib.Path, pattern: str, repl: str, flags=0):
               text = path.read_text(encoding="utf-8")
               new, n = re.subn(pattern, repl, text, count=1, flags=flags)
@@ -129,53 +138,17 @@ jobs:
                   raise SystemExit(f"Cargo.lock member versions updated {n}, expected >= {len(members)}")
               path.write_text(new, encoding="utf-8")
 
-          event = os.environ["EVENT_NAME"]
-          ref_name = os.environ["REF_NAME"]
-          input_version = os.environ.get("INPUT_VERSION", "").strip()
-          bump = (os.environ.get("INPUT_BUMP") or "none").strip()
-          input_prerelease = os.environ.get("INPUT_PRERELEASE", "false").lower() == "true"
-
-          conf_path = pathlib.Path("apps/desktop/src-tauri/tauri.conf.json")
-          current = json.loads(conf_path.read_text(encoding="utf-8"))["version"]
-
-          if event == "workflow_dispatch":
-              if input_version:
-                  version = normalize(input_version)
-                  parse_core(version)
-              elif bump != "none":
-                  major, minor, patch = parse_core(current)
-                  if bump == "major":
-                      version = f"{major + 1}.0.0"
-                  elif bump == "minor":
-                      version = f"{major}.{minor + 1}.0"
-                  elif bump == "patch":
-                      version = f"{major}.{minor}.{patch + 1}"
-                  else:
-                      raise SystemExit(f"Unknown bump: {bump}")
-              else:
-                  version = current
-          else:
-              version = normalize(ref_name)
-              parse_core(version)
-              if version != current:
-                  raise SystemExit(
-                      f"Tag v{version} does not match tauri.conf.json version {current}. "
-                      "Bump the repo version first, or use workflow_dispatch."
-                  )
-
-          tag = f"v{version}"
-          prerelease = "true" if (input_prerelease or "-" in version) else "false"
-
-          skip = "false"
-          if event == "push":
-              viewed = gh("release", "view", tag, "--json", "assets")
+          def version_taken(tag: str) -> bool:
+              viewed = gh("release", "view", tag, "--json", "id")
               if viewed.returncode == 0:
-                  assets = json.loads(viewed.stdout or "{}").get("assets") or []
-                  if assets:
-                      skip = "true"
-                      print(f"Release {tag} already has {len(assets)} asset(s); skipping duplicate tag run.")
+                  return True
+              tagged = subprocess.run(
+                  ["git", "rev-parse", "-q", "--verify", f"refs/tags/{tag}"],
+                  capture_output=True,
+              )
+              return tagged.returncode == 0
 
-          if skip == "false" and event == "workflow_dispatch" and version != current:
+          def bump_files(version: str):
               replace_once(
                   pathlib.Path("Cargo.toml"),
                   r'(?ms)(\[workspace\.package\].*?^version\s*=\s*")[^"]+(")',
@@ -193,6 +166,7 @@ jobs:
               )
               update_lock(version)
 
+          def commit_and_push(version: str, tag: str, branch: str):
               subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
               subprocess.run(
                   ["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"],
@@ -209,11 +183,91 @@ jobs:
                   ],
                   check=True,
               )
-              branch = ref_name or "main"
               subprocess.run(["git", "commit", "-m", f"chore(release): {tag}"], check=True)
               subprocess.run(["git", "pull", "--rebase", "origin", branch], check=True)
               subprocess.run(["git", "push", "origin", f"HEAD:{branch}"], check=True)
-              print(f"Bumped version {current} -> {version} and pushed.")
+              print(f"Bumped version to {version} and pushed.")
+
+          event = os.environ["EVENT_NAME"]
+          ref_name = os.environ["REF_NAME"]
+          ref_type = (os.environ.get("REF_TYPE") or "").strip()
+          input_version = os.environ.get("INPUT_VERSION", "").strip()
+          bump = (os.environ.get("INPUT_BUMP") or "none").strip()
+          input_prerelease = os.environ.get("INPUT_PRERELEASE", "false").lower() == "true"
+          commit_message = (os.environ.get("COMMIT_MESSAGE") or "").strip()
+          if not commit_message:
+              commit_message = subprocess.check_output(
+                  ["git", "log", "-1", "--pretty=%B"], text=True
+              ).strip()
+          first_line = commit_message.splitlines()[0] if commit_message else ""
+
+          subprocess.run(["git", "fetch", "--tags", "--force"], check=False)
+
+          conf_path = pathlib.Path("apps/desktop/src-tauri/tauri.conf.json")
+          current = json.loads(conf_path.read_text(encoding="utf-8"))["version"]
+
+          skip = "false"
+          should_bump = False
+
+          if event == "workflow_dispatch":
+              if input_version:
+                  version = normalize(input_version)
+                  parse_core(version)
+              elif bump != "none":
+                  major, minor, patch = parse_core(current)
+                  if bump == "major":
+                      version = format_core(major + 1, 0, 0)
+                  elif bump == "minor":
+                      version = format_core(major, minor + 1, 0)
+                  elif bump == "patch":
+                      version = format_core(major, minor, patch + 1)
+                  else:
+                      raise SystemExit(f"Unknown bump: {bump}")
+              else:
+                  version = current
+              should_bump = version != current
+          elif event == "push" and ref_type == "tag":
+              version = normalize(ref_name)
+              parse_core(version)
+              if version != current:
+                  raise SystemExit(
+                      f"Tag v{version} does not match tauri.conf.json version {current}. "
+                      "Bump the repo version first, or use workflow_dispatch."
+                  )
+          elif event == "push" and ref_type == "branch":
+              lowered = commit_message.lower()
+              if first_line.startswith("chore(release)") or "[skip release]" in lowered:
+                  skip = "true"
+                  version = current
+                  print(f"Skipping auto-release for commit: {first_line}")
+              else:
+                  major, minor, patch = parse_core(current)
+                  patch += 1
+                  version = format_core(major, minor, patch)
+                  while version_taken(f"v{version}"):
+                      patch += 1
+                      version = format_core(major, minor, patch)
+                  should_bump = True
+          else:
+              raise SystemExit(f"Unsupported event: {event} ref_type={ref_type!r}")
+
+          tag = f"v{version}"
+          prerelease = "true" if (input_prerelease or "-" in version) else "false"
+
+          if skip == "false" and event == "push" and ref_type == "tag":
+              viewed = gh("release", "view", tag, "--json", "assets")
+              if viewed.returncode == 0:
+                  assets = json.loads(viewed.stdout or "{}").get("assets") or []
+                  if assets:
+                      skip = "true"
+                      print(f"Release {tag} already has {len(assets)} asset(s); skipping duplicate tag run.")
+
+          if skip == "false" and should_bump:
+              bump_files(version)
+              branch = ref_name if ref_type == "branch" else (ref_name or "main")
+              if event == "workflow_dispatch":
+                  branch = os.environ.get("GITHUB_REF_NAME") or ref_name or "main"
+              commit_and_push(version, tag, branch)
 
           sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
           write_output(skip=skip, version=version, tag=tag, sha=sha, prerelease=prerelease)
