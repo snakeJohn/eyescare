@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "eyescare-core"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "chrono",
  "eyescare-platform",
@@ -1027,7 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "eyescare-desktop"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "chrono",
  "eyescare-core",
@@ -1047,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "eyescare-platform"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -1055,14 +1055,14 @@ dependencies = [
 
 [[package]]
 name = "eyescare-platform-mac"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "eyescare-platform",
 ]
 
 [[package]]
 name = "eyescare-platform-win"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "eyescare-platform",
  "tracing",
