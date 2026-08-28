@@ -33,6 +33,11 @@ pub enum SafeSource {
 /// hold 类型复用 config 定义（serde + 状态机共用，避免双枚举漂移）。
 pub use crate::config::SafeModeHold as SafeHold;
 
+/// Prevent untrusted IPC values from overflowing `Instant` when converted to
+/// a duration. A year is effectively indefinite for a temporary bypass while
+/// still keeping the deadline representable on all supported platforms.
+const MAX_SAFE_MINUTES: u64 = 365 * 24 * 60;
+
 /// 状态机状态（可持久化视图）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SafeModeStatus {
@@ -113,15 +118,20 @@ impl SafeModeController {
 
     /// 用户手动进入旁路（托盘/快捷键）。
     pub fn user_enter(&mut self) {
-        let minutes = self.config.default_minutes.max(1) as u64;
+        let minutes = (self.config.default_minutes as u64).clamp(1, MAX_SAFE_MINUTES);
         self.enter(SafeSource::User, SafeHold::Duration, None, minutes);
     }
 
     /// 用户延长（UserOn 时）。
     pub fn user_extend(&mut self, minutes: u64) {
         if self.state == SafeState::UserOn {
-            let minutes = minutes.max(1);
-            self.duration_until = Some(Instant::now() + Duration::from_secs(minutes * 60));
+            let minutes = minutes.clamp(1, MAX_SAFE_MINUTES);
+            let now = Instant::now();
+            let base = self
+                .duration_until
+                .filter(|until| *until > now)
+                .unwrap_or(now);
+            self.duration_until = Some(base + Duration::from_secs(minutes.saturating_mul(60)));
         }
     }
 
@@ -149,15 +159,25 @@ impl SafeModeController {
     ) -> bool {
         // 调试状态：旁路期间记录"本将命中"
         self.would_match_rule = rule_id.map(String::from);
-        if self.is_active() {
-            return false; // 旁路期间不触发动作（硬性规则 3）
-        }
 
         let Some(rule_id) = rule_id else {
             return false;
         };
-        if self.state != SafeState::Off {
+        // User-triggered bypass always wins.  A rule-triggered bypass may,
+        // however, transition to another matching rule (for example a
+        // while_match design rule to a duration rule) without waiting for a
+        // no-rule frame; otherwise the old hold semantics could remain
+        // latched indefinitely.
+        if self.state == SafeState::UserOn {
             return false;
+        }
+        let mut replaced_rule = false;
+        if self.state == SafeState::RuleOn {
+            if self.rule_id.as_deref() == Some(rule_id) && self.hold == Some(hold) {
+                return false;
+            }
+            self.leave();
+            replaced_rule = true;
         }
 
         // duration 防抖只拦 duration 规则（硬性规则 1：到期后 cooldown_until_app_change）。
@@ -165,20 +185,20 @@ impl SafeModeController {
         if hold == SafeHold::Duration {
             if let Some(last_key) = &self.last_rule_safe_key {
                 if scene_app_key.is_some() && scene_app_key == Some(last_key.as_str()) {
-                    return false;
+                    return replaced_rule;
                 }
             }
         }
         // 用户退出后抑制窗口（硬性规则 2 默认开）
         if let Some(until) = self.suppress_rule_until {
             if Instant::now() < until {
-                return false;
+                return replaced_rule;
             }
             self.suppress_rule_until = None;
         }
 
         let mins = if hold == SafeHold::Duration {
-            minutes.max(1)
+            minutes.clamp(1, MAX_SAFE_MINUTES)
         } else {
             0
         };
@@ -237,7 +257,7 @@ impl SafeModeController {
         self.rule_id = rule_id;
         self.entered_at = Some(Instant::now());
         self.duration_until = if hold == SafeHold::Duration && minutes > 0 {
-            Some(Instant::now() + Duration::from_secs(minutes * 60))
+            Some(Instant::now() + Duration::from_secs(minutes.saturating_mul(60)))
         } else {
             None
         };
@@ -359,6 +379,26 @@ mod tests {
         // while_match 规则在 appX 重新匹配 → 应放行（电平保持语义）
         assert!(sm.rule_eval(Some("figma-safe"), SafeHold::WhileMatch, Some("appX"), 0));
         assert_eq!(sm.status().state, SafeState::RuleOn);
+    }
+
+    #[test]
+    fn rule_hold_change_rearms_rule_bypass() {
+        let mut sm = SafeModeController::new(cfg());
+        assert!(sm.rule_eval(Some("design"), SafeHold::WhileMatch, Some("app"), 0));
+        assert!(sm.rule_eval(Some("limited"), SafeHold::Duration, Some("app"), 5));
+        assert_eq!(sm.status().rule_id.as_deref(), Some("limited"));
+        assert_eq!(sm.status().hold, Some(SafeHold::Duration));
+        assert!(sm.status().remaining_sec.unwrap() > 0);
+    }
+
+    #[test]
+    fn blocked_rule_replacement_still_removes_old_bypass() {
+        let mut sm = SafeModeController::new(cfg());
+        assert!(sm.rule_eval(Some("design"), SafeHold::WhileMatch, Some("app"), 0));
+        // Simulate a duration cooldown inherited from an earlier rule.
+        sm.last_rule_safe_key = Some("app".into());
+        assert!(sm.rule_eval(Some("limited"), SafeHold::Duration, Some("app"), 5));
+        assert_eq!(sm.status().state, SafeState::Off);
     }
 
     #[test]

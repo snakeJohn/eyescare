@@ -102,7 +102,7 @@ export interface Rule {
   if_: ConditionGroup;
   then: RuleAction;
   enabled_default: boolean;
-  /** 运行时启停（内存态；serde skip，不落盘） */
+  /** 运行/持久化启停；缺省时回落到 enabled_default。 */
   enabled?: boolean;
 }
 

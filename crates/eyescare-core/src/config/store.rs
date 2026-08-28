@@ -61,8 +61,13 @@ impl ConfigStore {
     pub fn load_rules(&self) -> Result<RulesConfig> {
         let path = self.rules_path();
         if path.exists() {
-            match load_rules_from(&path) {
-                Ok(rules) => return Ok(rules),
+            match self.load_rules_from(&path) {
+                Ok(rules) => {
+                    if rules.schema_version != read_schema_version(&path)? {
+                        self.save_rules(&rules)?;
+                    }
+                    return Ok(rules);
+                }
                 Err(e @ Error::UnsupportedSchema { .. }) => return Err(e),
                 Err(primary_err) => {
                     if let Ok(rules) = self.try_restore_rules_from_bak() {
@@ -110,8 +115,28 @@ impl ConfigStore {
         if !bak.exists() {
             return Err(Error::InvalidConfig("rules.json.bak missing".into()));
         }
-        let rules = load_rules_from(&bak)?;
+        let original_schema = read_schema_version(&bak)?;
+        let rules = self.load_rules_from(&bak)?;
         fs::copy(&bak, &path)?;
+        if rules.schema_version != original_schema {
+            self.save_rules(&rules)?;
+        }
+        Ok(rules)
+    }
+
+    fn load_rules_from(&self, path: &Path) -> Result<RulesConfig> {
+        let parsed = parse_json_file::<RulesConfig>(path)?;
+        if parsed.schema_version > SCHEMA_VERSION {
+            return Err(Error::UnsupportedSchema {
+                found: parsed.schema_version,
+                latest: SCHEMA_VERSION,
+            });
+        }
+        let mut rules = parsed;
+        if rules.schema_version < SCHEMA_VERSION {
+            rules.schema_version = SCHEMA_VERSION;
+        }
+        rules.validate_all()?;
         Ok(rules)
     }
 
@@ -142,8 +167,10 @@ impl ConfigStore {
         if cfg.schema_version < SCHEMA_VERSION {
             // v1 尚无历史版本；此处为未来迁移预留。
             cfg.schema_version = SCHEMA_VERSION;
+            let validated = cfg.validated()?;
             // 迁移是持久化动作：立即回写，保证下次加载无需再迁。
-            self.save_config(&cfg)?;
+            self.save_config(&validated)?;
+            return Ok(validated);
         }
         cfg.validated()
     }
@@ -203,16 +230,13 @@ fn parse_json_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
         .map_err(|e| Error::InvalidConfig(format!("parse {} failed: {e}", path.display())))
 }
 
-fn load_rules_from(path: &Path) -> Result<RulesConfig> {
-    let parsed = parse_json_file::<RulesConfig>(path)?;
-    if parsed.schema_version > SCHEMA_VERSION {
-        return Err(Error::UnsupportedSchema {
-            found: parsed.schema_version,
-            latest: SCHEMA_VERSION,
-        });
-    }
-    parsed.validate_all()?;
-    Ok(parsed)
+fn read_schema_version(path: &Path) -> Result<u32> {
+    let value = parse_json_file::<serde_json::Value>(path)?;
+    value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| Error::InvalidConfig(format!("missing/invalid schema_version in {}", path.display())))
 }
 
 fn reject_unless_current(found: u32) -> Result<()> {
@@ -374,6 +398,21 @@ mod tests {
         let loaded = store.load_rules().unwrap();
         assert_eq!(loaded.rules.len(), 1);
         assert!(path.exists());
+    }
+
+    #[test]
+    fn old_rules_schema_is_migrated_and_persisted() {
+        let store = ConfigStore::new(tmpdir());
+        fs::write(
+            store.rules_path(),
+            r#"{"schema_version":0,"match_policy":"first_match_wins","rules":[]}"#,
+        )
+        .unwrap();
+        let loaded = store.load_rules().unwrap();
+        assert_eq!(loaded.schema_version, SCHEMA_VERSION);
+        let persisted: RulesConfig =
+            serde_json::from_str(&fs::read_to_string(store.rules_path()).unwrap()).unwrap();
+        assert_eq!(persisted.schema_version, SCHEMA_VERSION);
     }
 
     #[test]

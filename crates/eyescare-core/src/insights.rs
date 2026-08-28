@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use chrono::{Local, NaiveDate};
+use chrono::{Local, NaiveDate, TimeZone};
 use rusqlite::Connection;
 
 use crate::error::Result;
@@ -174,9 +174,11 @@ impl InsightsStore {
         // 该日 UTC 范围：本地日 00:00 到次日 00:00
         let start_local = day.and_hms_opt(0, 0, 0).unwrap();
         let end_local = (day + chrono::Days::new(1)).and_hms_opt(0, 0, 0).unwrap();
-        let tz_offset = *Local::now().offset();
-        let start_utc = local_to_utc(start_local, tz_offset);
-        let end_utc = local_to_utc(end_local, tz_offset);
+        // Resolve each boundary in the local timezone independently.  Using
+        // the offset at `now` is wrong across DST transitions (a historical
+        // day can be one hour shorter/longer than the current offset).
+        let start_utc = local_to_utc(start_local, false);
+        let end_utc = local_to_utc(end_local, true);
 
         let mut stmt = self.conn.prepare(
             "SELECT ts_utc, active, filter_on, kelvin, brightness FROM heartbeats
@@ -341,11 +343,16 @@ impl InsightsStore {
 }
 
 /// 本地日边界 → UTC 时间戳（DST 安全：Ambiguous 取早值；None 兜底按 UTC 处理，绝不 panic）。
-fn local_to_utc(dt: chrono::NaiveDateTime, tz: chrono::FixedOffset) -> i64 {
+fn local_to_utc(dt: chrono::NaiveDateTime, is_end: bool) -> i64 {
     use chrono::LocalResult;
-    match dt.and_local_timezone(tz) {
+    match Local.from_local_datetime(&dt) {
         LocalResult::Single(t) => t.timestamp(),
-        LocalResult::Ambiguous(a, _) => a.timestamp(),
+        // At the fall-back boundary choose the earliest instant for the start
+        // and the latest instant for the end so the complete local day is
+        // included.
+        LocalResult::Ambiguous(a, b) => {
+            if is_end { b.timestamp() } else { a.timestamp() }
+        }
         LocalResult::None => dt.and_utc().timestamp(),
     }
 }

@@ -185,6 +185,22 @@ impl WindowsDisplayBackend {
         Ok(ok.as_bool())
     }
 
+    fn restore_dc(hdc: HDC, ramp: &Ramp, device_name: &str) -> Result<()> {
+        let ok = Self::write_ramp(hdc, ramp)?;
+        if !ok {
+            return Err(Error::GammaRejected(format!(
+                "SetDeviceGammaRamp failed while restoring {device_name}"
+            )));
+        }
+        let readback = Self::read_ramp(hdc)?;
+        if readback.mean_abs_diff(ramp) > READBACK_EPS {
+            return Err(Error::GammaRejected(format!(
+                "gamma readback mismatch while restoring {device_name}"
+            )));
+        }
+        Ok(())
+    }
+
     /// HDR 检测：GetDisplayConfigBufferSizes + QueryDisplayConfig（尽力，Win10 1703+）。
     /// advanced color 查 **target**（非 source）。键为 GDI 设备名（`\\.\DISPLAYn`）。
     /// 探测失败 → 空表，调用方对该屏视为 false（用户 Force 仍可通过 hdr_skip=false）。
@@ -339,7 +355,16 @@ impl DisplayBackend for WindowsDisplayBackend {
         };
         let mut out = Vec::with_capacity(snapshot.len());
         for (id, device_name, is_primary) in snapshot {
-            let hdc = Self::open_dc(&device_name)?;
+            let hdc = match Self::open_dc(&device_name) {
+                Ok(hdc) => hdc,
+                Err(error) => {
+                    // One monitor can disappear between enumeration and DC
+                    // creation. Keep the remaining displays usable and let
+                    // the topology watcher/rebind pick this one up later.
+                    tracing::warn!("skipping unavailable display {device_name}: {error}");
+                    continue;
+                }
+            };
             let (w, h) = unsafe { (GetDeviceCaps(hdc, HORZRES), GetDeviceCaps(hdc, VERTRES)) };
             unsafe {
                 let _ = DeleteDC(hdc);
@@ -435,15 +460,14 @@ impl DisplayBackend for WindowsDisplayBackend {
             (state.device_name.clone(), state.original_ramp.clone())
         };
         let hdc = Self::open_dc(&device_name)?;
-        if let Some(original) = original {
-            let _ = Self::write_ramp(hdc, &original);
-        } else {
-            let _ = Self::write_ramp(hdc, &Ramp::identity());
-        }
+        let result = (|| -> Result<()> {
+            let ramp = original.unwrap_or_else(Ramp::identity);
+            Self::restore_dc(hdc, &ramp, &device_name)
+        })();
         unsafe {
             let _ = DeleteDC(hdc);
         }
-        Ok(())
+        result
     }
 
     fn restore_all(&self) -> Result<()> {
@@ -455,18 +479,28 @@ impl DisplayBackend for WindowsDisplayBackend {
                 .map(|s| (s.device_name.clone(), s.original_ramp.clone()))
                 .collect()
         };
+        let mut first_error: Option<Error> = None;
         for (device_name, original) in snapshot {
-            let hdc = Self::open_dc(&device_name)?;
-            if let Some(original) = original {
-                let _ = Self::write_ramp(hdc, &original);
-            } else {
-                let _ = Self::write_ramp(hdc, &Ramp::identity());
-            }
-            unsafe {
-                let _ = DeleteDC(hdc);
+            let result = (|| -> Result<()> {
+                let hdc = Self::open_dc(&device_name)?;
+                let result = (|| -> Result<()> {
+                    let ramp = original.unwrap_or_else(Ramp::identity);
+                    Self::restore_dc(hdc, &ramp, &device_name)
+                })();
+                unsafe {
+                    let _ = DeleteDC(hdc);
+                }
+                result
+            })();
+            if let Err(error) = result {
+                // Continue restoring the remaining displays, but report the
+                // first failure so callers can surface an incomplete restore.
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     fn rebind_outputs(&self) -> Result<()> {

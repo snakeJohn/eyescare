@@ -75,6 +75,8 @@ pub struct TimerService {
     snoozed_once: bool,
     skipped: bool,
     last_input: Option<Instant>,
+    /// 上一次 tick 的单调时刻；用于抵消主循环调度抖动，避免计时越跑越慢。
+    last_tick: Option<Instant>,
     /// 空闲暂停阈值。
     idle_pause_sec: u64,
     /// 预通知窗口。
@@ -93,6 +95,7 @@ impl TimerService {
             snoozed_once: false,
             skipped: false,
             last_input: Some(Instant::now()),
+            last_tick: None,
             idle_pause_sec: cfg.idle_pause_sec.max(10) as u64,
             prebreak_sec: 30,
             events: Vec::new(),
@@ -128,6 +131,14 @@ impl TimerService {
 
     /// 周期性 tick（建议 1s）。`breaks_policy` 为当前全屏策略。
     pub fn tick(&mut self, now: Instant, breaks_policy: BreaksPolicy) -> Vec<TimerEvent> {
+        // 首次 tick 保持历史行为计 1 秒；之后按单调时钟补上 sleep/调度
+        // 抖动丢失的秒数。所有状态仍以整秒显示，避免 UI 出现小数倒计时。
+        let elapsed_sec = self
+            .last_tick
+            .map(|prev| now.saturating_duration_since(prev).as_secs().max(1))
+            .unwrap_or(1);
+        self.last_tick = Some(now);
+
         // 空闲检测：Working / PreBreak 均可暂停，避免预通知窗口空闲仍倒计时到 BreakDue
         let idle_sec = self
             .last_input
@@ -150,15 +161,21 @@ impl TimerService {
 
         match self.state {
             TimerState::Working => {
-                self.work_elapsed += Duration::from_secs(1);
-                // 进入 PreBreak 前 30s（含端点：work_sec ≤ prebreak_sec 时窗口退化为单点）
-                if self.work_elapsed.as_secs() >= self.cfg.work_sec.saturating_sub(self.prebreak_sec as u32) as u64
-                    && self.work_elapsed.as_secs() <= self.cfg.work_sec as u64
+                self.work_elapsed = self
+                    .work_elapsed
+                    .saturating_add(Duration::from_secs(elapsed_sec));
+                let work_sec = self.cfg.work_sec as u64;
+                let prebreak_start = work_sec.saturating_sub(self.prebreak_sec);
+                if self.work_elapsed.as_secs() >= work_sec {
+                    self.work_elapsed = Duration::ZERO;
+                    self.prebreak_remaining = None;
+                    self.handle_break_due(breaks_policy);
+                } else if self.work_elapsed.as_secs() >= prebreak_start
                     && self.prebreak_remaining.is_none()
                 {
                     self.state = TimerState::PreBreak;
                     self.prebreak_remaining = Some(Duration::from_secs(
-                        (self.cfg.work_sec as u64).saturating_sub(self.work_elapsed.as_secs()),
+                        work_sec.saturating_sub(self.work_elapsed.as_secs()),
                     ));
                     self.events.push(TimerEvent::PreBreakStarted);
                 }
@@ -167,33 +184,19 @@ impl TimerService {
                 let rem = self
                     .prebreak_remaining
                     .get_or_insert(Duration::from_secs(0))
-                    .saturating_sub(Duration::from_secs(1));
+                    .saturating_sub(Duration::from_secs(elapsed_sec));
                 self.prebreak_remaining = Some(rem);
                 if rem.is_zero() {
                     self.work_elapsed = Duration::ZERO;
                     self.prebreak_remaining = None;
-                    match breaks_policy {
-                        BreaksPolicy::Keep => {
-                            self.events.push(TimerEvent::BreakDue);
-                            self.start_break();
-                        }
-                        BreaksPolicy::NotifyOnly => {
-                            // 只通知，不进 Overlay；直接回 Working（§6.1 / R6）
-                            self.events.push(TimerEvent::BreakDue);
-                            self.state = TimerState::Working;
-                        }
-                        BreaksPolicy::Pause => {
-                            // 全屏：休息暂停，无提示（§5.4 breaks: pause）
-                            self.state = TimerState::Working;
-                        }
-                    }
+                    self.handle_break_due(breaks_policy);
                 }
             }
             TimerState::Break => {
                 let rem = self
                     .break_remaining
                     .get_or_insert(Duration::from_secs(0))
-                    .saturating_sub(Duration::from_secs(1));
+                    .saturating_sub(Duration::from_secs(elapsed_sec));
                 self.break_remaining = Some(rem);
                 if rem.is_zero() {
                     self.finish_break(true);
@@ -204,6 +207,24 @@ impl TimerService {
             }
         }
         std::mem::take(&mut self.events)
+    }
+
+    fn handle_break_due(&mut self, breaks_policy: BreaksPolicy) {
+        match breaks_policy {
+            BreaksPolicy::Keep => {
+                self.events.push(TimerEvent::BreakDue);
+                self.start_break();
+            }
+            BreaksPolicy::NotifyOnly => {
+                // 只通知，不进 Overlay；直接回 Working（§6.1 / R6）
+                self.events.push(TimerEvent::BreakDue);
+                self.state = TimerState::Working;
+            }
+            BreaksPolicy::Pause => {
+                // 全屏：休息暂停，无提示（§5.4 breaks: pause）
+                self.state = TimerState::Working;
+            }
+        }
     }
 
     fn start_break(&mut self) {
@@ -315,6 +336,16 @@ mod tests {
         }
         assert_eq!(t.state(), TimerState::Break);
         assert_eq!(t.status().break_remaining_sec, Some(10));
+    }
+
+    #[test]
+    fn delayed_tick_catches_up_elapsed_seconds() {
+        let mut t = TimerService::new(cfg(1200, 10));
+        let t0 = Instant::now();
+        t.note_activity_at(t0);
+        t.tick(t0, BreaksPolicy::Keep);
+        t.tick(t0 + Duration::from_secs(5), BreaksPolicy::Keep);
+        assert_eq!(t.status().work_elapsed_sec, 6);
     }
 
     #[test]

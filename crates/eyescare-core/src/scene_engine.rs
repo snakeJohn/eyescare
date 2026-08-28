@@ -26,6 +26,9 @@ pub struct SceneDecision {
     pub rule_safe_mode: Option<String>,
     /// 场景是否变化（app_key 或全屏状态变化），壳层据此决定是否 recompute。
     pub scene_changed: bool,
+    /// 仅 app_key 是否变化。SafeMode 的 duration 防抖只应在应用身份变化
+    /// 时清除，不能因为全屏置信度/状态变化而清除。
+    pub app_key_changed: bool,
 }
 
 /// 全屏策略下的休息行为（与 timer::BreaksPolicy 同构，避免 core 内部循环依赖）。
@@ -47,7 +50,7 @@ impl From<BreaksAction> for BreaksPolicy {
 }
 
 impl SceneDecision {
-    fn empty(app_key: Option<String>, scene_changed: bool) -> Self {
+    fn empty(app_key: Option<String>, scene_changed: bool, app_key_changed: bool) -> Self {
         Self {
             matched: None,
             app_key,
@@ -56,20 +59,50 @@ impl SceneDecision {
             rule_preset: None,
             rule_safe_mode: None,
             scene_changed,
+            app_key_changed,
         }
     }
 }
 
 /// 决策入口：对一次场景采样输出动作意图。
-/// `prev_app_key` 用于 scene_changed 判断（壳层维护最近一次 key）。
+/// `prev_app_key` 用于 app-key change 判断（壳层维护最近一次 key）。
 pub fn decide(
     engine: &RuleEngine,
     scene: Option<&SceneSnapshot>,
     prev_app_key: &Option<String>,
 ) -> SceneDecision {
+    // Backwards-compatible entry point: callers that only track app keys keep
+    // the historical app-key-only change semantics.
+    decide_impl(engine, scene, prev_app_key, None, false)
+}
+
+/// Decision entry point for callers that also track fullscreen state and
+/// confidence.  Fullscreen rules must be re-evaluated when the same app enters
+/// or leaves fullscreen; otherwise a while-match SafeMode rule can remain
+/// latched forever after leaving fullscreen.
+pub fn decide_with_scene_state(
+    engine: &RuleEngine,
+    scene: Option<&SceneSnapshot>,
+    prev_app_key: &Option<String>,
+    prev_fullscreen: &Option<(bool, eyescare_platform::FullscreenConfidence)>,
+) -> SceneDecision {
+    decide_impl(engine, scene, prev_app_key, Some(prev_fullscreen), true)
+}
+
+fn decide_impl(
+    engine: &RuleEngine,
+    scene: Option<&SceneSnapshot>,
+    prev_app_key: &Option<String>,
+    prev_fullscreen: Option<&Option<(bool, eyescare_platform::FullscreenConfidence)>>,
+    include_fullscreen: bool,
+) -> SceneDecision {
     let app_key = scene.and_then(|s| s.app_key());
-    let scene_changed = *prev_app_key != app_key;
-    let mut d = SceneDecision::empty(app_key.clone(), scene_changed);
+    let app_key_changed = *prev_app_key != app_key;
+    let fullscreen = scene.map(|s| (s.is_fullscreen, s.fullscreen_confidence));
+    let fullscreen_changed = include_fullscreen
+        && prev_fullscreen.map(|prev| *prev != fullscreen).unwrap_or(false);
+    let scene_changed = app_key_changed || fullscreen_changed;
+    let mut d = SceneDecision::empty(app_key.clone(), scene_changed, app_key_changed);
 
     let Some(scene) = scene else {
         // 无前台身份（桌面/锁屏）：无规则可匹配
@@ -170,6 +203,21 @@ mod tests {
         assert!(!d2.scene_changed);
         // 规则仍命中：rule_safe_mode 保持（电平保持，由 SafeMode 防抖处理）
         assert_eq!(d2.rule_safe_mode.as_deref(), Some("figma-safe"));
+    }
+
+    #[test]
+    fn fullscreen_change_is_a_scene_change_without_app_change() {
+        let engine = engine_with(builtin_templates());
+        let app = scene(Some("game.exe"), false);
+        let prev_key = app.app_key();
+        let d = decide_with_scene_state(
+            &engine,
+            Some(&scene(Some("game.exe"), true)),
+            &prev_key,
+            &Some((false, FullscreenConfidence::Unknown)),
+        );
+        assert!(d.scene_changed);
+        assert!(!d.app_key_changed);
     }
 
     #[test]

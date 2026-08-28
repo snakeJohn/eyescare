@@ -61,6 +61,8 @@ pub struct GuidedBreakPlayer {
     step_idx: usize,
     step_remaining: Duration,
     started_at: Option<Instant>,
+    /// 上一次 tick 的单调时刻；用于补偿主循环调度抖动。
+    last_tick: Option<Instant>,
     /// OS reduced motion：步骤静默化（不播 chime、无动画）。
     reduced_motion: bool,
     /// 音频静音（用户关闭声景）。
@@ -75,6 +77,7 @@ impl GuidedBreakPlayer {
             step_idx: 0,
             step_remaining: Duration::ZERO,
             started_at: None,
+            last_tick: None,
             reduced_motion: false,
             sound_enabled: true,
         }
@@ -89,6 +92,7 @@ impl GuidedBreakPlayer {
         self.step_idx = 0;
         self.step_remaining = Duration::from_secs(self.steps[0].duration_sec);
         self.started_at = Some(Instant::now());
+        self.last_tick = None;
     }
 
     /// 当前步骤（None = 未开始/结束）。
@@ -112,12 +116,31 @@ impl GuidedBreakPlayer {
         self.state
     }
 
-    /// tick（1s 粒度）。返回 true 表示步骤变化（UI 刷新）。
+    /// tick（固定推进 1s，供纯逻辑调用/测试）。返回 true 表示步骤变化。
     pub fn tick(&mut self) -> bool {
         if self.state != GuidedState::Playing {
             return false;
         }
-        self.step_remaining = self.step_remaining.saturating_sub(Duration::from_secs(1));
+        self.advance_elapsed(1)
+    }
+
+    /// 带单调时钟的 tick，供真实主循环调用以补偿调度抖动。
+    pub fn tick_at(&mut self, now: Instant) -> bool {
+        if self.state != GuidedState::Playing {
+            return false;
+        }
+        let elapsed_sec = self
+            .last_tick
+            .map(|prev| now.saturating_duration_since(prev).as_secs().max(1))
+            .unwrap_or(1);
+        self.last_tick = Some(now);
+        self.advance_elapsed(elapsed_sec)
+    }
+
+    fn advance_elapsed(&mut self, elapsed_sec: u64) -> bool {
+        self.step_remaining = self
+            .step_remaining
+            .saturating_sub(Duration::from_secs(elapsed_sec));
         if self.step_remaining.is_zero() {
             self.step_idx += 1;
             if self.step_idx >= self.steps.len() {

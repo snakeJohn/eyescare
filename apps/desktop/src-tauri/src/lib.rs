@@ -62,6 +62,9 @@ pub struct AppState {
     pub engine: Mutex<RuleEngine>,
     pub scene: Mutex<Option<SceneSnapshot>>,
     pub last_scene_key: Mutex<Option<String>>,
+    /// 上次采样的全屏状态/置信度。全屏规则依赖它，即使应用身份不变也要重算。
+    pub last_scene_fullscreen:
+        Mutex<Option<(bool, eyescare_platform::FullscreenConfidence)>>,
     pub breaks_policy: Mutex<BreaksPolicy>,
     pub guided: Mutex<Option<GuidedBreakPlayer>>,
     pub system: Arc<dyn SystemBackend>,
@@ -78,6 +81,9 @@ pub struct AppState {
     pub quitting: AtomicBool,
     /// 上次已应用到 DisplayService 的规则声明签名（避免每秒 recompute）。
     pub last_claim_sig: Mutex<Option<(Option<(String, String)>, bool, Option<String>)>>,
+    /// 上次成功同步到 DisplayService 的 SafeMode 是否激活；失败时保留 None
+    /// 让主循环下次重试。
+    pub last_safe_claim_active: Mutex<Option<bool>>,
 }
 
 // ---------- 显示命令 ----------
@@ -125,15 +131,18 @@ fn set_display_params(
     kelvin: u32,
     brightness: f64,
 ) -> Result<(), String> {
+    if !brightness.is_finite() {
+        return Err("brightness must be finite".into());
+    }
     let k = kelvin.clamp(1000, 10000);
     let b = brightness.clamp(0.01, 1.0);
-    let mut cfg = state.config.lock().unwrap();
-    cfg.display.kelvin = k;
-    cfg.display.brightness = b;
-    cfg.display.preset = "custom".into();
-    cfg.display.manual_lock = true;
-    state.store.save_config(&cfg).map_err(|e| e.to_string())?;
-    drop(cfg);
+    let mut next = lock_mutex(&state.config).clone();
+    next.display.kelvin = k;
+    next.display.brightness = b;
+    next.display.preset = "custom".into();
+    next.display.manual_lock = true;
+    state.store.save_config(&next).map_err(|e| e.to_string())?;
+    *lock_mutex(&state.config) = next;
     // P2 claim（对所有已枚举屏）
     let ids = display_ids(&state);
     let claims: Vec<(String, Claim)> = ids
@@ -150,10 +159,10 @@ fn set_display_params(
 /// 取消用户锁定（回落到规则/昼夜/默认）。
 #[tauri::command]
 fn release_manual_lock(state: State<'_, AppState>) -> Result<(), String> {
-    let mut cfg = state.config.lock().unwrap();
-    cfg.display.manual_lock = false;
-    state.store.save_config(&cfg).map_err(|e| e.to_string())?;
-    drop(cfg);
+    let mut next = lock_mutex(&state.config).clone();
+    next.display.manual_lock = false;
+    state.store.save_config(&next).map_err(|e| e.to_string())?;
+    *lock_mutex(&state.config) = next;
     state.filter_enabled.store(true, Ordering::Relaxed);
     state.display.set_applies_enabled(true);
     state.display.remove_source("user");
@@ -169,18 +178,17 @@ fn set_preset(state: State<'_, AppState>, preset: String) -> Result<(), String> 
 
 fn apply_preset(state: &State<'_, AppState>, preset: String) -> Result<(), String> {
     let is_smart = preset == "smart";
-    {
-        let mut cfg = lock_mutex(&state.config);
-        let (k, b) = preset_params(&preset, &cfg);
-        cfg.display.preset = preset;
-        cfg.display.kelvin = k;
-        cfg.display.brightness = b;
-        cfg.display.manual_lock = !is_smart;
-        if is_smart {
-            cfg.display.day_night.enabled = true;
-        }
-        state.store.save_config(&cfg).map_err(|e| e.to_string())?;
+    let mut next = lock_mutex(&state.config).clone();
+    let (k, b) = preset_params(&preset, &next);
+    next.display.preset = preset;
+    next.display.kelvin = k;
+    next.display.brightness = b;
+    next.display.manual_lock = !is_smart;
+    if is_smart {
+        next.display.day_night.enabled = true;
     }
+    state.store.save_config(&next).map_err(|e| e.to_string())?;
+    *lock_mutex(&state.config) = next;
     state.filter_enabled.store(true, Ordering::Relaxed);
     state.display.set_applies_enabled(true);
     if is_smart {
@@ -203,6 +211,7 @@ fn apply_preset(state: &State<'_, AppState>, preset: String) -> Result<(), Strin
 fn restore_display(state: State<'_, AppState>) -> Result<(), String> {
     state.filter_enabled.store(false, Ordering::Relaxed);
     *lock_mutex(&state.last_daynight_kelvin) = None;
+    *lock_mutex(&state.last_safe_claim_active) = None;
     state.display.restore_all().map_err(|e| e.to_string())
 }
 
@@ -248,6 +257,13 @@ fn get_rules(state: State<'_, AppState>) -> RulesConfig {
 
 #[tauri::command]
 fn save_rules(state: State<'_, AppState>, rules: RulesConfig) -> Result<(), String> {
+    if rules.schema_version != eyescare_core::config::SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported rules schema {}, expected {}",
+            rules.schema_version,
+            eyescare_core::config::SCHEMA_VERSION
+        ));
+    }
     rules.validate_all().map_err(|e| e.to_string())?;
     state
         .store
@@ -265,9 +281,9 @@ fn set_rule_enabled(
     rule_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    let mut rules = state.rules.lock().unwrap();
+    let mut next = lock_mutex(&state.rules).clone();
     let mut found = false;
-    for r in rules.rules.iter_mut() {
+    for r in next.rules.iter_mut() {
         if r.id == rule_id {
             r.enabled = Some(enabled);
             found = true;
@@ -277,23 +293,20 @@ fn set_rule_enabled(
     if !found {
         return Err(format!("rule not found: {rule_id}"));
     }
-    state
-        .store
-        .save_rules(&rules)
-        .map_err(|e| e.to_string())?;
-    drop(rules);
+    state.store.save_rules(&next).map_err(|e| e.to_string())?;
+    *lock_mutex(&state.rules) = next;
     refresh_engine(&state);
     Ok(())
 }
 
 #[tauri::command]
 fn install_templates(state: State<'_, AppState>) -> Result<usize, String> {
-    let mut rules = state.rules.lock().unwrap();
-    let before = rules.rules.len();
-    merge_templates(&mut rules.rules, builtin_templates()).map_err(|e| e.to_string())?;
-    let added = rules.rules.len() - before;
-    state.store.save_rules(&rules).map_err(|e| e.to_string())?;
-    drop(rules);
+    let mut next = lock_mutex(&state.rules).clone();
+    let before = next.rules.len();
+    merge_templates(&mut next.rules, builtin_templates()).map_err(|e| e.to_string())?;
+    let added = next.rules.len() - before;
+    state.store.save_rules(&next).map_err(|e| e.to_string())?;
+    *lock_mutex(&state.rules) = next;
     refresh_engine(&state);
     Ok(added)
 }
@@ -306,11 +319,10 @@ fn set_timer_config(app: AppHandle, state: State<'_, AppState>, config: TimerCon
     if config.work_sec < 30 || config.break_sec < 5 || config.idle_pause_sec < 10 {
         return Err("invalid timer config: work_sec>=30, break_sec>=5, idle_pause_sec>=10".into());
     }
-    {
-        let mut cfg = lock_mutex(&state.config);
-        cfg.timer = config.clone();
-        state.store.save_config(&cfg).map_err(|e| e.to_string())?;
-    }
+    let mut next = lock_mutex(&state.config).clone();
+    next.timer = config.clone();
+    state.store.save_config(&next).map_err(|e| e.to_string())?;
+    *lock_mutex(&state.config) = next;
     lock_mutex(&state.timer).apply_config(config);
     emit_status(&app, &state);
     Ok(())
@@ -319,11 +331,10 @@ fn set_timer_config(app: AppHandle, state: State<'_, AppState>, config: TimerCon
 #[tauri::command]
 fn set_day_night_config(state: State<'_, AppState>, config: DayNightConfig) -> Result<(), String> {
     day_night_valid(&config)?;
-    {
-        let mut cfg = state.config.lock().unwrap();
-        cfg.display.day_night = config;
-        state.store.save_config(&cfg).map_err(|e| e.to_string())?;
-    }
+    let mut next = lock_mutex(&state.config).clone();
+    next.display.day_night = config;
+    state.store.save_config(&next).map_err(|e| e.to_string())?;
+    *lock_mutex(&state.config) = next;
     // 立即重算昼夜（滤镜关闭时不回写 ramp）
     if state.filter_enabled.load(Ordering::Relaxed) {
         update_daynight_claims(&state);
@@ -374,9 +385,10 @@ fn set_multi_monitor(
         "per_display" => eyescare_core::config::MultiMonitorMode::PerDisplay,
         _ => return Err(format!("unknown multi_monitor mode: {mode}")),
     };
-    let mut cfg = state.config.lock().unwrap();
-    cfg.display.multi_monitor = m;
-    state.store.save_config(&cfg).map_err(|e| e.to_string())?;
+    let mut next = lock_mutex(&state.config).clone();
+    next.display.multi_monitor = m;
+    state.store.save_config(&next).map_err(|e| e.to_string())?;
+    *lock_mutex(&state.config) = next;
     Ok(())
 }
 
@@ -387,13 +399,27 @@ fn set_hdr_policy(state: State<'_, AppState>, policy: String) -> Result<(), Stri
         "force" => eyescare_core::config::HdrPolicy::Force,
         _ => return Err(format!("unknown hdr_policy: {policy}")),
     };
-    let mut cfg = lock_mutex(&state.config);
-    cfg.display.hdr_policy = p;
-    state.store.save_config(&cfg).map_err(|e| e.to_string())?;
-    drop(cfg);
+    let mut next = lock_mutex(&state.config).clone();
+    next.display.hdr_policy = p;
+    state.store.save_config(&next).map_err(|e| e.to_string())?;
+    *lock_mutex(&state.config) = next;
+    let filter_on = state.filter_enabled.load(Ordering::Relaxed);
+    if filter_on {
+        // The resolver target is unchanged when only HDR policy changes. A
+        // plain recompute would therefore skip the display, leaving a forced
+        // ramp active after switching to Skip (or never applying it after
+        // switching to Force). Restore and rebuild all claims to make the
+        // policy transition take effect immediately.
+        if let Err(error) = state.display.restore_all() {
+            tracing::warn!("restore before HDR policy change failed: {error}");
+        }
+    }
     state
         .display
         .set_hdr_skip(matches!(p, eyescare_core::config::HdrPolicy::Skip));
+    if filter_on {
+        reapply_display_sources(&state);
+    }
     Ok(())
 }
 
@@ -422,7 +448,13 @@ fn set_shortcuts(
         start_break,
     };
     let previous = lock_mutex(&state.config).shortcuts.clone();
-    register_shortcuts(&app, &next)?;
+    if let Err(error) = register_shortcuts(&app, &next) {
+        // register_shortcuts starts by unregistering all bindings. Restore the
+        // previous set when any new binding is rejected, otherwise a failed
+        // save would silently leave the app with no global shortcuts.
+        let _ = register_shortcuts(&app, &previous);
+        return Err(error);
+    }
     let mut cfg = lock_mutex(&state.config);
     cfg.shortcuts = next;
     if let Err(error) = state.store.save_config(&cfg) {
@@ -455,8 +487,7 @@ fn register_shortcuts(
         (shortcuts.start_break.as_str(), HotkeyAction::StartBreak),
     ];
     for (combo, action) in bindings {
-        manager
-            .on_shortcut(combo, move |app, _shortcut, event| {
+        if let Err(error) = manager.on_shortcut(combo, move |app, _shortcut, event| {
                 if event.state != ShortcutState::Pressed {
                     return;
                 }
@@ -489,8 +520,13 @@ fn register_shortcuts(
                             }
                         }
                     });
-            })
-            .map_err(|e| e.to_string())?;
+            }) {
+            // Registration is a batch operation from the user's point of
+            // view. Do not leave a partially installed set when one combo is
+            // rejected by the OS.
+            let _ = manager.unregister_all();
+            return Err(error.to_string());
+        }
     }
     Ok(())
 }
@@ -547,8 +583,19 @@ fn start_user_guided_break(app: &AppHandle, state: &State<'_, AppState>) {
         timer.start_break_now();
         timer.drain_events()
     };
+    let started = events
+        .iter()
+        .any(|event| matches!(event, TimerEvent::BreakStarted));
     for event in events {
         handle_timer_event(app, state, event, OverlayPolicy::Force);
+    }
+    // Manual breaks do not pass through BreakDue, but they should still be
+    // represented in the prompt/compliance denominator. Otherwise a manually
+    // completed break makes completed > prompted and yields >100% compliance.
+    if started {
+        if let Some(db) = lock_mutex(&state.insights).as_ref() {
+            let _ = db.record_break(chrono::Utc::now().timestamp(), "break_prompted");
+        }
     }
     emit_status(app, state);
 }
@@ -630,6 +677,16 @@ fn tick_once(app: &AppHandle) {
         emit_status(app, &state);
     }
 
+    // Retry a previously rejected SafeMode sync without recomputing it on
+    // every tick once it has succeeded.
+    if filter_on {
+        let active = lock_mutex(&state.safe_mode).is_active();
+        let synced = *lock_mutex(&state.last_safe_claim_active);
+        if synced != Some(active) {
+            apply_safe_claims(&state);
+        }
+    }
+
     // 3) 前台采样 + 场景决策（主循环 1s 粒度；设计 750ms 节拍，壳层 1s tick 即最密节拍）
     scene_step(app, &state);
 
@@ -669,7 +726,7 @@ fn tick_once(app: &AppHandle) {
     {
         let mut guided = state.guided.lock().unwrap();
         if let Some(player) = guided.as_mut() {
-            if player.tick() {
+            if player.tick_at(Instant::now()) {
                 emit_status(app, &state);
             }
             if player.state() == eyescare_core::guided::GuidedState::Done {
@@ -692,12 +749,23 @@ fn scene_step(app: &AppHandle, state: &State<'_, AppState>) {
     let decision = {
         let engine = state.engine.lock().unwrap();
         let last_key = state.last_scene_key.lock().unwrap().clone();
-        scene_engine::decide(&engine, scene.as_ref(), &last_key)
+        let last_fullscreen = *state.last_scene_fullscreen.lock().unwrap();
+        scene_engine::decide_with_scene_state(
+            &engine,
+            scene.as_ref(),
+            &last_key,
+            &last_fullscreen,
+        )
     };
 
     // 更新 last key（scene_changed 依据）
-    if decision.scene_changed {
+    if decision.app_key_changed {
         *state.last_scene_key.lock().unwrap() = decision.app_key.clone();
+    }
+    if decision.scene_changed {
+        *state.last_scene_fullscreen.lock().unwrap() = scene
+            .as_ref()
+            .map(|s| (s.is_fullscreen, s.fullscreen_confidence));
     }
 
     // SafeMode 规则联动（先算完再释放锁，避免 apply_safe_claims / emit_status 重入死锁）
@@ -717,7 +785,7 @@ fn scene_step(app: &AppHandle, state: &State<'_, AppState>) {
                 .unwrap_or((eyescare_core::config::SafeModeHold::WhileMatch, 0));
             sm.rule_eval(Some(rule_id), hold, key, minutes)
         } else {
-            sm.scene_changed(false, decision.scene_changed)
+            sm.scene_changed(false, decision.app_key_changed)
         }
     };
     if sm_changed {
@@ -728,24 +796,27 @@ fn scene_step(app: &AppHandle, state: &State<'_, AppState>) {
     }
 
     // 规则预设 / 全屏策略 claims：声明未变则跳过 set_source + recompute
+    // SafeMode（用户或规则）期间禁止 P3 预设写入，避免旁路窗口内又被
+    // 场景规则改色；退出旁路后下一次 scene tick 会重新声明 P3。
+    let safe_active = lock_mutex(&state.safe_mode).is_active();
+    let effective_rule_preset = if safe_active {
+        None
+    } else {
+        decision.rule_preset.clone()
+    };
     let sig = (
-        decision.rule_preset.clone(),
+        effective_rule_preset.clone(),
         decision.filter_paused,
         decision.rule_safe_mode.clone(),
     );
     let claims_changed = {
-        let mut last = lock_mutex(&state.last_claim_sig);
-        if last.as_ref() == Some(&sig) {
-            false
-        } else {
-            *last = Some(sig);
-            true
-        }
+        let last = lock_mutex(&state.last_claim_sig);
+        last.as_ref() != Some(&sig)
     };
 
     if state.filter_enabled.load(Ordering::Relaxed) && claims_changed {
         let ids = display_ids(state);
-        if let Some((rule_id, preset)) = &decision.rule_preset {
+        if let Some((rule_id, preset)) = &effective_rule_preset {
             let (k, b) = preset_params(preset, &lock_mutex(&state.config));
             let claims: Vec<(String, Claim)> = ids
                 .iter()
@@ -765,7 +836,15 @@ fn scene_step(app: &AppHandle, state: &State<'_, AppState>) {
             state.display.remove_source("policy_pause");
         }
         if state.filter_enabled.load(Ordering::Relaxed) {
-            let _ = state.display.recompute();
+            let applied = state
+                .display
+                .recompute()
+                .map(|summary| !summary.any_failure())
+                .unwrap_or(false);
+            // Only mark the signature after a successful recompute. A
+            // rejected/failed apply must be retried on the next scene tick.
+            let mut last = lock_mutex(&state.last_claim_sig);
+            *last = if applied { Some(sig) } else { None };
         }
     }
 
@@ -773,23 +852,31 @@ fn scene_step(app: &AppHandle, state: &State<'_, AppState>) {
 }
 
 /// SafeMode P1 claims 同步到 DisplayService。
-fn apply_safe_claims(state: &State<'_, AppState>) {
+fn apply_safe_claims(state: &State<'_, AppState>) -> bool {
     if !state.filter_enabled.load(Ordering::Relaxed) {
-        return;
+        return false;
     }
-    let sm = lock_mutex(&state.safe_mode);
-    let ids = display_ids(state);
-    let claims = sm.p1_claims(&ids);
-    drop(sm);
+    let (active, claims) = {
+        let sm = lock_mutex(&state.safe_mode);
+        let active = sm.is_active();
+        let ids = display_ids(state);
+        (active, sm.p1_claims(&ids))
+    };
     if claims.is_empty() {
         state.display.remove_source("safe");
     } else {
         state.display.set_source("safe", claims);
     }
     if !state.filter_enabled.load(Ordering::Relaxed) {
-        return;
+        return false;
     }
-    let _ = state.display.recompute();
+    let success = state
+        .display
+        .recompute()
+        .map(|summary| !summary.any_failure())
+        .unwrap_or(false);
+    *lock_mutex(&state.last_safe_claim_active) = if success { Some(active) } else { None };
+    success
 }
 
 /// DayNight P4 claim 更新（目标变化才 recompute）。
@@ -846,14 +933,11 @@ fn heartbeat_step(state: &State<'_, AppState>) {
         let active = idle_sec < 5 * 60; // 5 分钟无输入视为不活跃（锁屏/离开）
         let sm = state.safe_mode.lock().unwrap();
         let cfg = state.config.lock().unwrap();
+        let targets = state.display.current_targets();
         let filter_on = active
             && !sm.is_active()
             && !state.display.known_displays().is_empty()
-            && !state
-                .display
-                .current_targets()
-                .values()
-                .all(|r| r.is_identity());
+            && targets.values().any(|r| !r.is_identity());
         let _ = db.heartbeat(HeartbeatSample {
             ts_utc: now,
             active,
@@ -1008,6 +1092,7 @@ fn refresh_engine(state: &State<'_, AppState>) {
 fn reload_config_into_state(app: &AppHandle, state: &State<'_, AppState>) -> Result<(), String> {
     let cfg = state.store.load_config().map_err(|e| e.to_string())?;
     let rules = state.store.load_rules().map_err(|e| e.to_string())?;
+    let previous_shortcuts = lock_mutex(&state.config).shortcuts.clone();
     *lock_mutex(&state.config) = cfg.clone();
     *lock_mutex(&state.rules) = rules;
     lock_mutex(&state.timer).apply_config(cfg.timer.clone());
@@ -1022,6 +1107,9 @@ fn reload_config_into_state(app: &AppHandle, state: &State<'_, AppState>) -> Res
     }
     if let Err(e) = register_shortcuts(app, &cfg.shortcuts) {
         tracing::warn!("re-register shortcuts after import failed: {e}");
+        // Keep the imported config, but ensure the old bindings remain usable
+        // when the new combination is unavailable on this machine.
+        let _ = register_shortcuts(app, &previous_shortcuts);
     }
     emit_status(app, state);
     Ok(())
@@ -1030,10 +1118,17 @@ fn reload_config_into_state(app: &AppHandle, state: &State<'_, AppState>) -> Res
 fn set_filter(app: &AppHandle, state: &State<'_, AppState>, enabled: bool) {
     state.filter_enabled.store(enabled, Ordering::Relaxed);
     if enabled {
+        // A monitor may have been added/removed while the filter was off and
+        // its system event can be missed. Refresh the cache before rebuilding
+        // claims so newly connected displays are included immediately.
+        if let Err(error) = state.display.rebind_and_refresh() {
+            tracing::warn!("display rebind while enabling filter failed: {error}");
+        }
         state.display.set_applies_enabled(true);
         reapply_display_sources(state);
     } else {
         *lock_mutex(&state.last_daynight_kelvin) = None;
+        *lock_mutex(&state.last_safe_claim_active) = None;
         let _ = state.display.restore_all();
     }
     emit_status(app, state);
@@ -1083,6 +1178,10 @@ fn begin_quit(app: &AppHandle) {
 
 fn reapply_display_sources(state: &State<'_, AppState>) {
     state.display.set_applies_enabled(true);
+    // DisplayService::restore_all/rebind clears its source/target maps. Do
+    // not let the cached Kelvin make update_daynight_claims skip rebuilding
+    // the daynight source after such a reset.
+    *lock_mutex(&state.last_daynight_kelvin) = None;
     let ids = display_ids(state);
     let cfg = lock_mutex(&state.config);
     let (k, b) = preset_params(&cfg.display.preset, &cfg);
@@ -1273,6 +1372,9 @@ fn show_settings(app: &AppHandle) {
 }
 
 fn show_break_overlay(app: &AppHandle) {
+    if !break_is_active(app) {
+        return;
+    }
     if let Some(w) = app.get_webview_window("break") {
         let _ = w.unminimize();
         let _ = w.set_always_on_top(true);
@@ -1295,6 +1397,11 @@ fn show_break_overlay(app: &AppHandle) {
 }
 
 fn show_break_overlay_inner(app: &AppHandle) {
+    // The timer may have been skipped while the delayed window creation was
+    // waiting. Never resurrect an overlay for a completed break.
+    if !break_is_active(app) {
+        return;
+    }
     if let Some(w) = app.get_webview_window("break") {
         let _ = w.unminimize();
         let _ = w.set_always_on_top(true);
@@ -1320,6 +1427,10 @@ fn show_break_overlay_inner(app: &AppHandle) {
     .background_color(tauri::window::Color(12, 11, 9, 255));
     match builder.build() {
         Ok(window) => {
+            if !break_is_active(app) {
+                let _ = window.close();
+                return;
+            }
             if let Some(icon) = app.default_window_icon() {
                 let _ = window.set_icon(icon.clone());
             }
@@ -1338,6 +1449,12 @@ fn show_break_overlay_inner(app: &AppHandle) {
         }
         Err(e) => tracing::error!("failed to open break overlay: {e}"),
     }
+}
+
+fn break_is_active(app: &AppHandle) -> bool {
+    app.try_state::<AppState>()
+        .map(|state| lock_mutex(&state.timer).state() == TimerState::Break)
+        .unwrap_or(false)
 }
 
 fn close_break_overlay(app: &AppHandle) {
@@ -1518,6 +1635,7 @@ pub fn run() {
                 engine: Mutex::new(engine),
                 scene: Mutex::new(None),
                 last_scene_key: Mutex::new(None),
+                last_scene_fullscreen: Mutex::new(None),
                 breaks_policy: Mutex::new(BreaksPolicy::Keep),
                 guided: Mutex::new(None),
                 system,
@@ -1528,6 +1646,7 @@ pub fn run() {
                 filter_enabled: AtomicBool::new(true),
                 quitting: AtomicBool::new(false),
                 last_claim_sig: Mutex::new(None),
+                last_safe_claim_active: Mutex::new(None),
             };
             app.manage(state);
             let shortcuts = app.state::<AppState>().config.lock().unwrap().shortcuts.clone();
@@ -1562,13 +1681,18 @@ pub fn run() {
                         return;
                     }
                     if let Some(state) = h.try_state::<AppState>() {
+                        // Keep the display cache/snapshots in sync even while
+                        // the filter is disabled; otherwise a topology change
+                        // during that period leaves stale IDs when the user
+                        // enables the filter again.
+                        let _ = state.display.rebind_and_refresh();
                         if !state.filter_enabled.load(Ordering::Relaxed) {
                             return;
                         }
-                        let _ = state.display.rebind_and_refresh();
-                        *lock_mutex(&state.last_claim_sig) = None;
-                        update_daynight_claims(&state);
-                        apply_safe_claims(&state);
+                        // Rebuild every source, not only day/night and
+                        // SafeMode: a newly connected display must inherit
+                        // the current default/user/rule claims as well.
+                        reapply_display_sources(&state);
                     }
                 }));
             }

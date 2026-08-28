@@ -152,7 +152,22 @@ impl DisplayService {
                 if !self.applies_enabled.load(Ordering::SeqCst) {
                     continue;
                 }
-                self.backend.restore(&DisplayId(t.display_id.clone()))?;
+                match self.backend.restore(&DisplayId(t.display_id.clone())) {
+                    Ok(()) => {}
+                    Err(eyescare_platform::Error::DisplayGone(_)) => {
+                        self.target.lock().unwrap().remove(&t.display_id);
+                        next_current.remove(&t.display_id);
+                        self.animating.lock().unwrap().remove(&t.display_id);
+                        summary.gone.push(ApplyReport {
+                            display_id: DisplayId(t.display_id.clone()),
+                            outcome: ApplyOutcome::DisplayGone,
+                            readback_diff: 0.0,
+                            readback_vs_original_diff: 0.0,
+                        });
+                        continue;
+                    }
+                    Err(error) => return Err(DisplayServiceError::Backend(error)),
+                }
                 self.target
                     .lock()
                     .unwrap()
@@ -176,12 +191,32 @@ impl DisplayService {
             if prev_target.is_none() {
                 // 首次出现：直接 apply；仅 Applied 写入 current/target
                 let report = self.apply_one(&t.display_id, &target_ramp)?;
-                if report.outcome == ApplyOutcome::Applied {
-                    self.target
-                        .lock()
-                        .unwrap()
-                        .insert(t.display_id.clone(), target_ramp.clone());
-                    next_current.insert(t.display_id.clone(), target_ramp.clone());
+                match report.outcome {
+                    ApplyOutcome::Applied => {
+                        self.target
+                            .lock()
+                            .unwrap()
+                            .insert(t.display_id.clone(), target_ramp.clone());
+                        next_current.insert(t.display_id.clone(), target_ramp.clone());
+                    }
+                    ApplyOutcome::HdrSkipped => {
+                        // HDR may have become active while a previous ramp
+                        // was already on the panel. Restore the startup ramp
+                        // before dropping our bookkeeping; merely skipping
+                        // the new write would leave the old tint in place.
+                        if next_current.contains_key(&t.display_id) {
+                            let _ = self
+                                .backend
+                                .restore(&DisplayId(t.display_id.clone()));
+                        }
+                        self.target.lock().unwrap().remove(&t.display_id);
+                        next_current.remove(&t.display_id);
+                    }
+                    ApplyOutcome::DisplayGone => {
+                        self.target.lock().unwrap().remove(&t.display_id);
+                        next_current.remove(&t.display_id);
+                    }
+                    ApplyOutcome::Rejected => {}
                 }
                 self.animating.lock().unwrap().remove(&t.display_id);
                 self.classify(&mut summary, report);
@@ -210,6 +245,14 @@ impl DisplayService {
     /// 热插拔后重绑输出并刷新枚举缓存。
     pub fn rebind_and_refresh(&self) -> Result<(), DisplayServiceError> {
         self.backend.rebind_outputs()?;
+        // A reconnect can reuse the same stable ID while the hardware has
+        // reset its gamma ramp. Never treat the old target/current as already
+        // applied after a topology or power event. Clear these before the
+        // enumeration refresh too, so a refresh failure cannot leave stale
+        // state that makes the next recompute skip a necessary write.
+        self.target.lock().unwrap().clear();
+        self.current.lock().unwrap().clear();
+        self.animating.lock().unwrap().clear();
         self.refresh_displays()
     }
 
@@ -242,22 +285,44 @@ impl DisplayService {
             };
             let report = self.apply_one(&id, &ramp)?;
             // pump 只更新 current；target 保持动画终点
-            if report.outcome == ApplyOutcome::Applied {
-                self.current.lock().unwrap().insert(id.clone(), ramp.clone());
-                if new_progress >= 1.0 {
-                    finished.push(id.clone());
-                } else {
-                    self.animating
-                        .lock()
-                        .unwrap()
-                        .insert(id.clone(), (from, to, new_progress));
+            match report.outcome {
+                ApplyOutcome::Applied => {
+                    self.current.lock().unwrap().insert(id.clone(), ramp.clone());
+                    if new_progress >= 1.0 {
+                        finished.push(id.clone());
+                    } else {
+                        self.animating
+                            .lock()
+                            .unwrap()
+                            .insert(id.clone(), (from, to, new_progress));
+                    }
                 }
-            } else {
-                // Rejected / skip：保持动画，下次 pump 重试（不得把终点当成已落地）
-                self.animating.lock().unwrap().insert(
-                    id.clone(),
-                    (from, to, progress.min(0.999)),
-                );
+                ApplyOutcome::HdrSkipped => {
+                    // HDR skip is intentional, not a transient failure. Do
+                    // not leave a permanent animation retry loop. The target
+                    // is removed so a later HDR/topology change can retry.
+                    if self.current.lock().unwrap().contains_key(&id) {
+                        let _ = self.backend.restore(&DisplayId(id.clone()));
+                    }
+                    self.target.lock().unwrap().remove(&id);
+                    self.current.lock().unwrap().remove(&id);
+                    finished.push(id.clone());
+                }
+                ApplyOutcome::DisplayGone => {
+                    // A disconnected display cannot make progress. Drop its
+                    // state and let the next rebind enumerate it again.
+                    self.target.lock().unwrap().remove(&id);
+                    self.current.lock().unwrap().remove(&id);
+                    finished.push(id.clone());
+                }
+                ApplyOutcome::Rejected => {
+                    // Rejected: keep the animation and retry on the next pump
+                    // (the OS may have temporarily refused the ramp).
+                    self.animating.lock().unwrap().insert(
+                        id.clone(),
+                        (from, to, progress.min(0.999)),
+                    );
+                }
             }
             self.classify(&mut summary, report);
         }
@@ -277,10 +342,23 @@ impl DisplayService {
             });
         }
         // HDR 屏由 backend 返回 HdrSkipped；后端负责策略
-        let report = self
+        match self
             .backend
-            .apply_ramp(&DisplayId(id.to_string()), ramp)?;
-        Ok(report)
+            .apply_ramp(&DisplayId(id.to_string()), ramp)
+        {
+            Ok(report) => Ok(report),
+            // A stale display cache is expected during hot-unplug. Normalize
+            // the platform error to the trait's terminal outcome so an
+            // animation is dropped instead of retrying forever until the
+            // topology watcher runs.
+            Err(eyescare_platform::Error::DisplayGone(_)) => Ok(ApplyReport {
+                display_id: DisplayId(id.to_string()),
+                outcome: ApplyOutcome::DisplayGone,
+                readback_diff: 0.0,
+                readback_vs_original_diff: 0.0,
+            }),
+            Err(error) => Err(DisplayServiceError::Backend(error)),
+        }
     }
 
     fn classify(&self, summary: &mut ApplySummary, report: ApplyReport) {
@@ -297,12 +375,15 @@ impl DisplayService {
     /// 恢复全部屏到启动快照（托盘「恢复显示」/退出钩子）。
     pub fn restore_all(&self) -> Result<(), DisplayServiceError> {
         self.applies_enabled.store(false, Ordering::SeqCst);
-        self.backend.restore_all()?;
+        // Clear in-memory state even when the backend fails. Keeping stale
+        // targets after a failed restore can make the next enable path skip
+        // re-application, leaving the actual gamma state unknown.
+        let result = self.backend.restore_all();
         self.sources.lock().unwrap().clear();
         self.animating.lock().unwrap().clear();
         self.target.lock().unwrap().clear();
         self.current.lock().unwrap().clear();
-        Ok(())
+        result.map_err(DisplayServiceError::from)
     }
 
     /// 注册 panic hook：best-effort restore（强杀无法保证，文档说明）。

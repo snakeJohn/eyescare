@@ -27,7 +27,7 @@ pub enum FullscreenKind {
     None,
 }
 
-/// 规范身份（§5.1）。`app_key` 由采集方计算：`sha256(process_name|bundle_id)`。
+/// 规范身份（§5.1）。优先 bundle_id，其次 process_name；比较时不区分大小写。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SceneContext {
     /// Win 主键："Code.exe"；mac 可为空。

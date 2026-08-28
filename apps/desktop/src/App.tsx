@@ -112,15 +112,20 @@ const DEFAULT_DRAFT: AppConfig = {
 
 function fmtClock(sec: number | null | undefined): string {
   if (sec == null) return "—";
-  const m = Math.floor(sec / 60);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
   const s = sec % 60;
+  if (h > 0) {
+    return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  }
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
 function fmtDuration(sec: number): string {
   const h = Math.floor(sec / 3600);
-  const m = Math.round((sec % 3600) / 60);
+  const m = Math.floor((sec % 3600) / 60);
   if (h > 0) return `${h} 小时 ${m} 分`;
+  if (m === 0) return `${sec} 秒`;
   return `${m} 分钟`;
 }
 
@@ -246,12 +251,12 @@ export default function App() {
           <StatusPills />
         </header>
         <main className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
-          {tab === "display" && <DisplayTab />}
+          {tab === "display" && <DisplayTab key={`d${configRev}`} />}
           {tab === "rules" && <RulesTab key={`r${configRev}`} />}
           {tab === "breaks" && <BreaksTab key={`b${configRev}`} />}
           {tab === "insights" && <InsightsTab />}
           {tab === "rhythm" && <RhythmTab key={`rh${configRev}`} />}
-          {tab === "shortcuts" && <ShortcutsTab />}
+          {tab === "shortcuts" && <ShortcutsTab key={`s${configRev}`} />}
           {tab === "general" && <GeneralTab onImported={() => setConfigRev((v) => v + 1)} />}
           {tab === "about" && <AboutTab version={version} />}
         </main>
@@ -547,9 +552,11 @@ function DisplayTab() {
               ) : null}
             </div>
             <div className="ml-auto flex gap-2">
-              <button type="button" className="btn-ghost" onClick={extendSafe}>
-                +15 分钟
-              </button>
+              {safe?.source === "user" && (
+                <button type="button" className="btn-ghost" onClick={extendSafe}>
+                  +15 分钟
+                </button>
+              )}
               <button type="button" className="btn-danger" onClick={toggleSafe}>
                 退出旁路
               </button>
@@ -700,10 +707,12 @@ function DisplayTab() {
                   name="multi"
                   checked={multi === v}
                   onChange={() => {
+                    const previous = multi;
                     setMulti(v);
-                    api.setMultiMonitor(v).catch((e) =>
-                      push(`保存失败：${(e as Error).message}`, "err"),
-                    );
+                    api.setMultiMonitor(v).catch((e) => {
+                      setMulti(previous);
+                      push(`保存失败：${(e as Error).message}`, "err");
+                    });
                   }}
                   className="accent-amber-500"
                 />
@@ -801,6 +810,7 @@ function RulesTab() {
 
   const toggleRule = async (id: string, on: boolean) => {
     if (!rules) return;
+    const previous = rules;
     setRules({
       ...rules,
       rules: rules.rules.map((r) => (r.id === id ? { ...r, enabled: on } : r)),
@@ -808,6 +818,7 @@ function RulesTab() {
     try {
       await api.setRuleEnabled(id, on); // 落盘 + 引擎热更新
     } catch (e) {
+      setRules(previous);
       push(`保存失败：${(e as Error).message}`, "err");
     }
   };
@@ -891,7 +902,10 @@ function RulesTab() {
                     {describeAction(r.then)}
                   </div>
                 </div>
-                <Switch checked={!!r.enabled} onChange={(v) => toggleRule(r.id, v)} />
+                <Switch
+                  checked={r.enabled ?? r.enabled_default}
+                  onChange={(v) => toggleRule(r.id, v)}
+                />
                 <button type="button" className="btn-danger text-xs" onClick={() => deleteRule(r.id)}>删除</button>
               </li>
             ))}

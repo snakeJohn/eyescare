@@ -7,7 +7,7 @@
 //! - `display_apply_failed`：每屏每分钟最多 1 次 UI
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// core 对外事件（UI / 洞察 / 诊断消费）。
 #[derive(Debug, Clone, PartialEq)]
@@ -30,7 +30,7 @@ pub enum CoreEvent {
 }
 
 /// 事件监听器。
-type Listener = Box<dyn Fn(CoreEvent) + Send + Sync>;
+type Listener = Arc<dyn Fn(CoreEvent) + Send + Sync>;
 
 /// 带节流的事件总线（线程安全）。
 pub struct EventBus {
@@ -51,11 +51,22 @@ impl EventBus {
     }
 
     pub fn subscribe(&self, f: Box<dyn Fn(CoreEvent) + Send + Sync>) {
-        self.listeners.lock().unwrap().push(f);
+        self.listeners
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(Arc::from(f));
     }
 
     fn emit(&self, e: CoreEvent) {
-        for f in self.listeners.lock().unwrap().iter() {
+        // Never hold the listener mutex while invoking user code.  A listener
+        // may subscribe or emit another event, and doing so under the lock
+        // would deadlock the event bus.
+        let listeners = self
+            .listeners
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        for f in listeners {
             f(e.clone());
         }
     }
@@ -70,9 +81,19 @@ impl EventBus {
 
     /// scene_changed：仅 app_key 变化时 emit。
     pub fn scene_changed(&self, app_key: Option<String>) {
-        let mut last = self.last_scene_key.lock().unwrap();
-        if *last != app_key {
-            *last = app_key.clone();
+        let changed = {
+            let mut last = self
+                .last_scene_key
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if *last != app_key {
+                *last = app_key.clone();
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
             self.emit(CoreEvent::SceneChanged { app_key });
         }
     }
@@ -88,10 +109,21 @@ impl EventBus {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let mut last = self.apply_failed_last.lock().unwrap();
-        let l = last.entry(display_id.to_string()).or_insert(0);
-        if now.saturating_sub(*l) >= 60 {
-            *l = now;
+        let should_emit = {
+            let mut last = self
+                .apply_failed_last
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let should = last
+                .get(display_id)
+                .map(|prev| now.saturating_sub(*prev) >= 60)
+                .unwrap_or(true);
+            if should {
+                last.insert(display_id.to_string(), now);
+            }
+            should
+        };
+        if should_emit {
             self.emit(CoreEvent::DisplayApplyFailed {
                 display_id: display_id.to_string(),
                 code: code.to_string(),

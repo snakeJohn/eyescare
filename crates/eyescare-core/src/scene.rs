@@ -35,7 +35,7 @@ impl SceneSnapshot {
         }
     }
 
-    /// 身份键：`sha256(process_name|bundle_id)`（小写十六进制）。
+    /// 身份键：`sha256(normalized_identity)`（小写十六进制）。
     /// 采集不到身份时（桌面等）返回 None。
     pub fn app_key(&self) -> Option<String> {
         let identity = self
@@ -43,7 +43,11 @@ impl SceneSnapshot {
             .clone()
             .or_else(|| self.process_name.clone())?;
         let mut hasher = Sha256::new();
-        hasher.update(identity.as_bytes());
+        // Windows process names and bundle identifiers are compared
+        // case-insensitively by the platform layer.  Normalize here too so
+        // a casing-only change does not look like an app switch and reset
+        // SafeMode cooldowns/scene claims.
+        hasher.update(identity.to_lowercase().as_bytes());
         Some(format!("{:x}", hasher.finalize()))
     }
 
@@ -96,5 +100,12 @@ mod tests {
             display_id: None,
         };
         assert_eq!(s.app_key(), None);
+    }
+
+    #[test]
+    fn app_key_is_case_stable() {
+        let mut upper = sample();
+        upper.bundle_id = Some("COM.MICROSOFT.VSCODE".into());
+        assert_eq!(sample().app_key(), upper.app_key());
     }
 }

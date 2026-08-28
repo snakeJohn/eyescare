@@ -138,6 +138,28 @@ jobs:
                   raise SystemExit(f"Cargo.lock member versions updated {n}, expected >= {len(members)}")
               path.write_text(new, encoding="utf-8")
 
+          def update_npm_lock(version: str):
+              path = pathlib.Path("apps/desktop/package-lock.json")
+              text = path.read_text(encoding="utf-8")
+              text, root_count = re.subn(
+                  r'(?ms)^(\{\s*"name":\s*"[^"]+",\s*"version":\s*")[^"]+("),',
+                  rf'\g<1>{version}\2,',
+                  text,
+                  count=1,
+              )
+              text, package_count = re.subn(
+                  r'(?ms)("packages":\s*\{\s*"":\s*\{\s*"name":\s*"[^"]+",\s*"version":\s*")[^"]+("),',
+                  rf'\g<1>{version}\2,',
+                  text,
+                  count=1,
+              )
+              if root_count != 1 or package_count != 1:
+                  raise SystemExit(
+                      f"Failed to update apps/desktop/package-lock.json "
+                      f"(root={root_count}, package={package_count})"
+                  )
+              path.write_text(text, encoding="utf-8")
+
           def version_taken(tag: str) -> bool:
               viewed = gh("release", "view", tag, "--json", "id")
               if viewed.returncode == 0:
@@ -165,6 +187,7 @@ jobs:
                   rf"\g<1>{version}\2",
               )
               update_lock(version)
+              update_npm_lock(version)
 
           def commit_and_push(version: str, tag: str, branch: str):
               subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
@@ -179,6 +202,7 @@ jobs:
                       "Cargo.toml",
                       "Cargo.lock",
                       "apps/desktop/package.json",
+                      "apps/desktop/package-lock.json",
                       "apps/desktop/src-tauri/tauri.conf.json",
                   ],
                   check=True,
